@@ -477,6 +477,8 @@ func evaluateAccuracy(bp *phase.Phase, X, Y *mat.Dense) (exactAcc, closeAcc, pro
 	// Clamp network before evaluation to ensure stability
 	autoClampIfInf(bp, float64(minClamp), float64(maxClamp))
 
+	sampleContribution := 100.0 / float64(nSamples) // Each sample’s max contribution to exact accuracy
+
 	for i := 0; i < nSamples; i++ {
 		inputs := make(map[int]float64)
 		for px := 0; px < 784; px++ {
@@ -501,28 +503,29 @@ func evaluateAccuracy(bp *phase.Phase, X, Y *mat.Dense) (exactAcc, closeAcc, pro
 		pred := argmax(vals)
 		if pred == actual {
 			correctExact++
+			totalProximity += sampleContribution // Full contribution for exact match
+		} else {
+			correctVal := vals[actual]
+			proximityRatio := 0.0
+			if !math.IsNaN(correctVal) && correctVal >= 0 && maxVal > 0 {
+				if correctVal <= maxVal {
+					proximityRatio = correctVal / maxVal // Lower than max
+				} else {
+					proximityRatio = maxVal / correctVal // Higher than max, invert to scale down
+				}
+			}
+			totalProximity += proximityRatio * sampleContribution // Partial contribution
 		}
 
 		correctVal := vals[actual]
 		if !math.IsNaN(correctVal) && correctVal >= closeThreshold*maxVal {
 			correctClose++
 		}
-
-		proximityRatio := 0.0
-		if !math.IsNaN(correctVal) && maxVal > 0 {
-			proximityRatio = correctVal / maxVal
-			if proximityRatio > 1 {
-				proximityRatio = 1.0
-			} else if proximityRatio < 0 {
-				proximityRatio = 0.0
-			}
-		}
-		totalProximity += proximityRatio
 	}
 
 	exactAcc = float64(correctExact) / float64(nSamples)
 	closeAcc = float64(correctClose) / float64(nSamples)
-	proximityScore = (totalProximity / float64(nSamples)) * 100
+	proximityScore = totalProximity // Percentage out of 100%
 	if math.IsNaN(proximityScore) || math.IsInf(proximityScore, 0) {
 		proximityScore = 0.0 // Final safeguard
 	}
