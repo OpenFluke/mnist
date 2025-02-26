@@ -15,8 +15,7 @@ import (
 
 	"gonum.org/v1/gonum/mat"
 
-	// Adjust this import path to your local "phase" folder if needed.
-	"phase"
+	"phase" // Adjust this import path to your local "phase" folder if needed.
 )
 
 // ============================================================================
@@ -27,12 +26,11 @@ const (
 	baseURL  = "https://storage.googleapis.com/cvdf-datasets/mnist/"
 	mnistDir = "mnist_data"
 
-	// Adjust these for a quick or thorough demonstration
-	trainLimit = 30000
-	testLimit  = 10000
+	trainLimit = 3000
+	testLimit  = 1000
 
 	// Evolution hyperparameters
-	populationSize      = 100
+	populationSize      = 50
 	numGenerations      = 500
 	selectionPercentage = 0.3
 	mutationRate        = 0.3
@@ -49,17 +47,14 @@ const (
 	stagnationCounterMax  = 5
 	Complexity1MinNeurons = 10
 	Complexity1MaxNeurons = 30
-
 	Complexity2MinNeurons = 50
 	Complexity2MaxNeurons = 80
-
 	Complexity3MinNeurons = 100
 	Complexity3MaxNeurons = 500
 
 	maxClamp = 1000
 	minClamp = -1000
 
-	// Threshold for close accuracy
 	closeThreshold = 0.9
 )
 
@@ -67,7 +62,7 @@ const (
 type EvolutionaryState struct {
 	Population        []*phase.Phase
 	Generation        int
-	BestFitness       float64 // Changed to BestFitness to reflect combined metric
+	BestFitness       float64
 	ComplexityLevel   int
 	StagnationCounter int
 }
@@ -82,6 +77,16 @@ type Results struct {
 	TestProximityScore  float64
 }
 
+// BestModelTracker tracks the best model with synchronization
+type BestModelTracker struct {
+	mu                 sync.Mutex
+	overallBestModel   *phase.Phase
+	bestExactAcc       float64
+	bestCloseAcc       float64
+	bestProximityScore float64
+	updated            bool
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -89,13 +94,11 @@ type Results struct {
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
-	// 1) Download/unzip MNIST data if needed
 	bp := phase.NewPhase()
 	if err := ensureMNISTDownloads(bp, mnistDir); err != nil {
 		log.Fatalf("Failed to ensure MNIST data: %v", err)
 	}
 
-	// 2) Load partial MNIST into gonum matrices
 	trainX, trainY, err := loadMNIST(mnistDir, "train-images-idx3-ubyte", "train-labels-idx1-ubyte", trainLimit)
 	if err != nil {
 		log.Fatalf("Error loading training MNIST: %v", err)
@@ -105,7 +108,6 @@ func main() {
 		log.Fatalf("Error loading testing MNIST: %v", err)
 	}
 
-	// 3) Evolve networks on MNIST, concurrent training
 	trainTesting(trainX, trainY, testX, testY)
 	fmt.Println("Done.")
 }
@@ -133,13 +135,10 @@ func ensureMNISTDownloads(bp *phase.Phase, targetDir string) error {
 			if err := bp.DownloadFile(localPath, baseURL+f); err != nil {
 				return fmt.Errorf("failed to download %s: %w", f, err)
 			}
-			fmt.Printf("Downloaded %s\n", f)
 			fmt.Printf("Unzipping %s...\n", f)
 			if err := bp.UnzipFile(localPath, targetDir); err != nil {
 				return fmt.Errorf("failed to unzip %s: %w", f, err)
 			}
-		} else {
-			fmt.Printf("%s already exists, skipping download.\n", f)
 		}
 	}
 	return nil
@@ -192,14 +191,12 @@ func loadMNIST(dir, imageFile, labelFile string, limit int) (*mat.Dense, *mat.De
 
 	buf := make([]byte, 784)
 	for i := 0; i < limit; i++ {
-		// read image
 		if _, err := fImg.Read(buf); err != nil {
 			return nil, nil, fmt.Errorf("read image data: %w", err)
 		}
 		for j := 0; j < 784; j++ {
 			dataX.Set(i, j, float64(buf[j])/255.0)
 		}
-		// read label
 		var lblByte [1]byte
 		if _, err := fLbl.Read(lblByte[:]); err != nil {
 			return nil, nil, fmt.Errorf("read label data: %w", err)
@@ -217,7 +214,6 @@ func loadMNIST(dir, imageFile, labelFile string, limit int) (*mat.Dense, *mat.De
 func trainTesting(trainX, trainY, testX, testY *mat.Dense) {
 	fmt.Println(time.Now())
 
-	// Create folder for saving
 	if err := os.MkdirAll(saveFolder, 0755); err != nil {
 		log.Fatalf("Failed to create folder %s: %v", saveFolder, err)
 	}
@@ -227,12 +223,16 @@ func trainTesting(trainX, trainY, testX, testY *mat.Dense) {
 	var bestFitness float64
 	var complexityLevel int
 	var stagnationCounter int
-	var overallBestModel *phase.Phase
-	var bestExactAcc, bestCloseAcc, bestProximityScore float64
+
+	bestModelTracker := &BestModelTracker{
+		bestExactAcc:       -1,
+		bestCloseAcc:       -1,
+		bestProximityScore: -1,
+		updated:            false,
+	}
 
 	statePath := filepath.Join(saveFolder, stateFile)
 	if _, err := os.Stat(statePath); err == nil {
-		// Load existing state
 		st, err := loadState(stateFile)
 		if err != nil {
 			log.Fatalf("Failed to load state: %v", err)
@@ -244,19 +244,13 @@ func trainTesting(trainX, trainY, testX, testY *mat.Dense) {
 		stagnationCounter = st.StagnationCounter
 		fmt.Printf("Resuming from generation %d with best fitness %.4f\n", gen, bestFitness)
 	} else {
-		// Create initial population
 		population = createInitialPopulation(populationSize)
 		gen = 0
 		bestFitness = 0.0
 		complexityLevel = 1
 		stagnationCounter = 0
-		// Initialize best metrics with negative values to ensure first model sets them
-		bestExactAcc = -1
-		bestCloseAcc = -1
-		bestProximityScore = -1
 	}
 
-	// Main evolutionary loop
 	for gen < numGenerations {
 		fmt.Printf("\n=== Generation %d (Complexity Level: %d) ===\n", gen, complexityLevel)
 		fmt.Println(time.Now())
@@ -266,7 +260,11 @@ func trainTesting(trainX, trainY, testX, testY *mat.Dense) {
 		closeAccs := make([]float64, populationSize)
 		proximityScores := make([]float64, populationSize)
 
-		// Train & evaluate all networks concurrently
+		// Reset updated flag at the start of each generation
+		bestModelTracker.mu.Lock()
+		bestModelTracker.updated = false
+		bestModelTracker.mu.Unlock()
+
 		var wg sync.WaitGroup
 		wg.Add(len(population))
 		for i, bp := range population {
@@ -274,86 +272,80 @@ func trainTesting(trainX, trainY, testX, testY *mat.Dense) {
 			bpCopy := bp
 			go func() {
 				defer wg.Done()
-				//fmt.Printf("  -> Training network %d...\n", iCopy)
-				//trainNetwork(bpCopy, trainX, trainY, trainEpochs)
 
-				// Evaluate all metrics
 				exactAcc, closeAcc, proximityScore := evaluateAccuracy(bpCopy, testX, testY)
-
-				// Combined fitness score (weights: 0.5 exact, 0.3 close, 0.2 proximity)
 				fitness[iCopy] = (0.5 * exactAcc) + (0.3 * closeAcc) + (0.2 * proximityScore / 100)
 				exactAccs[iCopy] = exactAcc
 				closeAccs[iCopy] = closeAcc
 				proximityScores[iCopy] = proximityScore
 
-				fmt.Printf("     Network %d done: testExactAcc=%.2f%%, testCloseAcc=%.2f%%, testProximityScore=%.2f%%\n",
+				fmt.Printf("     Network %d: exact=%.2f%%, close=%.2f%%, proximity=%.2f%%\n",
 					iCopy, exactAcc*100, closeAcc*100, proximityScore)
 
-				// Hierarchical best model update
+				bestModelTracker.mu.Lock()
 				updateReason := ""
-				if exactAcc > bestExactAcc {
+				if exactAcc > bestModelTracker.bestExactAcc {
 					updateReason = "exact accuracy improved"
-				} else if exactAcc == bestExactAcc && closeAcc > bestCloseAcc {
+				} else if exactAcc == bestModelTracker.bestExactAcc && closeAcc > bestModelTracker.bestCloseAcc {
 					updateReason = "close accuracy improved"
-				} else if exactAcc == bestExactAcc && closeAcc == bestCloseAcc && proximityScore > bestProximityScore {
+				} else if exactAcc == bestModelTracker.bestExactAcc && closeAcc == bestModelTracker.bestCloseAcc && proximityScore > bestModelTracker.bestProximityScore {
 					updateReason = "proximity score improved"
 				}
 				if updateReason != "" {
-					bestExactAcc = exactAcc
-					bestCloseAcc = closeAcc
-					bestProximityScore = proximityScore
-					overallBestModel = bpCopy.Copy()
+					bestModelTracker.overallBestModel = bpCopy.Copy()
+					bestModelTracker.bestExactAcc = exactAcc
+					bestModelTracker.bestCloseAcc = closeAcc
+					bestModelTracker.bestProximityScore = proximityScore
+					bestModelTracker.updated = true
 					fmt.Printf("     => New best model selected (%s): exact=%.2f%%, close=%.2f%%, proximity=%.2f%%\n",
 						updateReason, exactAcc*100, closeAcc*100, proximityScore)
 				}
+				bestModelTracker.mu.Unlock()
 			}()
 		}
 		wg.Wait()
 
-		// Find the best fitness this generation
 		currentBest, bestIndex := maxFitness(fitness)
 		fmt.Printf("Best fitness this generation: %.4f (exact=%.2f%%, close=%.2f%%, proximity=%.2f%%)\n",
 			currentBest, exactAccs[bestIndex]*100, closeAccs[bestIndex]*100, proximityScores[bestIndex])
 
-		// Save the best model based on fitness
 		if err := saveModel(population[bestIndex], gen, currentBest, currentBest > bestFitness); err != nil {
 			log.Printf("Failed to save model (gen %d): %v", gen, err)
 		}
 
-		// Early stopping if fitness is near perfect (adjust threshold as needed)
 		if currentBest >= 0.9999 {
 			bestFitness = currentBest
-			if overallBestModel == nil {
-				overallBestModel = population[bestIndex].Copy()
+			if bestModelTracker.overallBestModel == nil {
+				bestModelTracker.overallBestModel = population[bestIndex].Copy()
 			}
 			fmt.Printf("Reached near-perfect fitness; stopping at generation %d.\n", gen)
 			finishAndExit(population, gen+1, bestFitness, complexityLevel, stagnationCounter,
-				overallBestModel, trainX, trainY, testX, testY)
+				bestModelTracker.overallBestModel, trainX, trainY, testX, testY)
 			return
 		}
 
-		// Evolution logic based on fitness
-		if currentBest > bestFitness {
+		// Evolution: Always create next generation from top performers, including best model
+		selected := selectTopPerformers(population, exactAccs, closeAccs, proximityScores, selectionPercentage)
+		population = createNextGeneration(selected, populationSize, mutationRate, complexityLevel, bestModelTracker.overallBestModel)
+
+		bestModelTracker.mu.Lock()
+		if bestModelTracker.updated {
 			bestFitness = currentBest
 			stagnationCounter = 0
-			selected := selectTopPerformers(population, fitness, selectionPercentage)
-			population = createNextGeneration(selected, populationSize, mutationRate, complexityLevel)
-			fmt.Printf("  => Improvement in fitness! New best: %.4f\n", bestFitness)
+			fmt.Printf("  => Improvement! New best model with exact=%.2f%%, close=%.2f%%, proximity=%.2f%%\n",
+				bestModelTracker.bestExactAcc*100, bestModelTracker.bestCloseAcc*100, bestModelTracker.bestProximityScore)
+			bestModelTracker.updated = false
 		} else {
 			stagnationCounter++
-			fmt.Printf("  => No improvement in fitness. Stagnation %d/%d\n", stagnationCounter, stagnationCounterMax)
+			fmt.Printf("  => No improvement. Stagnation %d/%d\n", stagnationCounter, stagnationCounterMax)
 			if stagnationCounter >= stagnationCounterMax {
 				complexityLevel++
 				stagnationCounter = 0
 				fmt.Printf("  => Complexity raised to %d\n", complexityLevel)
 			}
-			// Mutate entire population
-			for _, bp := range population {
-				mutate(bp, mutationRate, complexityLevel)
-			}
 		}
+		bestModelTracker.mu.Unlock()
 
-		// Save updated state
 		st := EvolutionaryState{
 			Population:        population,
 			Generation:        gen + 1,
@@ -368,10 +360,9 @@ func trainTesting(trainX, trainY, testX, testY *mat.Dense) {
 		gen++
 	}
 
-	// If loop completes
-	if overallBestModel != nil {
-		trainExact, trainClose, trainProx := evaluateAccuracy(overallBestModel, trainX, trainY)
-		testExact, testClose, testProx := evaluateAccuracy(overallBestModel, testX, testY)
+	if bestModelTracker.overallBestModel != nil {
+		trainExact, trainClose, trainProx := evaluateAccuracy(bestModelTracker.overallBestModel, trainX, trainY)
+		testExact, testClose, testProx := evaluateAccuracy(bestModelTracker.overallBestModel, testX, testY)
 		results := Results{
 			TrainExactAcc:       trainExact,
 			TrainCloseAcc:       trainClose,
@@ -383,17 +374,14 @@ func trainTesting(trainX, trainY, testX, testY *mat.Dense) {
 		if err := saveResults(results, resultsFile); err != nil {
 			log.Printf("Failed to save results: %v", err)
 		}
-		visualizeResults(overallBestModel, trainX, trainY, testX, testY)
-	} else {
-		fmt.Println("No best model found? Unexpected.")
+		visualizeResults(bestModelTracker.overallBestModel, trainX, trainY, testX, testY)
 	}
 	fmt.Printf("Final best fitness after %d generations: %.4f\n", gen, bestFitness)
 	fmt.Println(time.Now())
 }
 
 func finishAndExit(pop []*phase.Phase, g int, bestFitness float64, comp int, stag int, bestModel *phase.Phase,
-	trainX, trainY, testX, testY *mat.Dense,
-) {
+	trainX, trainY, testX, testY *mat.Dense) {
 	state := EvolutionaryState{
 		Population:        pop,
 		Generation:        g,
@@ -427,25 +415,21 @@ func finishAndExit(pop []*phase.Phase, g int, bestFitness float64, comp int, sta
 func createInitialPopulation(popSize int) []*phase.Phase {
 	pop := make([]*phase.Phase, popSize)
 	for i := 0; i < popSize; i++ {
-		// Example: 784->64->10
 		bp := phase.NewPhaseWithLayers([]int{784, 64, 10}, "relu", "linear")
 		pop[i] = bp
 	}
 	return pop
 }
 
-// trainNetwork: we do mini-batch = 1. For concurrency across population, not inside each net.
 func trainNetwork(bp *phase.Phase, X, Y *mat.Dense, epochs int) {
 	nSamples, _ := X.Dims()
 	for e := 0; e < epochs; e++ {
 		perm := rand.Perm(nSamples)
 		for _, i := range perm {
-			// Prepare inputs
 			inputs := make(map[int]float64)
 			for px := 0; px < 784; px++ {
 				inputs[bp.InputNodes[px]] = X.At(i, px)
 			}
-			// Build one-hot
 			label := int(Y.At(i, 0))
 			expected := make(map[int]float64)
 			for out := 0; out < 10; out++ {
@@ -453,32 +437,23 @@ func trainNetwork(bp *phase.Phase, X, Y *mat.Dense, epochs int) {
 			}
 			expected[bp.OutputNodes[label]] = 1.0
 
-			// 1) Forward
 			bp.Forward(inputs, 1)
-
-			// 2) Backprop training
-			//bp.TrainNetwork(inputs, expected, learningRate, minClamp, maxClamp)
-			//bp.TrainNetworkTargeted(inputs, expected, learningRate, float64(minClamp), float64(maxClamp), bp.TrainableNeurons)
-
-			// 3) Immediate clamping to prevent propagation of NaN/Inf
-
+			// Uncomment and adjust training method as needed
+			// bp.TrainNetwork(inputs, expected, learningRate, minClamp, maxClamp)
 		}
 		autoClampIfInf(bp, float64(minClamp), float64(maxClamp))
 	}
 }
 
-// evaluateAccuracy: computes exact accuracy, close accuracy, and proximity score
 func evaluateAccuracy(bp *phase.Phase, X, Y *mat.Dense) (exactAcc, closeAcc, proximityScore float64) {
 	nSamples, _ := X.Dims()
 	correctExact := 0
-	totalClose := 0.0 // Sum of closeness percentages
+	totalClose := 0.0
 	totalProximity := 0.0
 
-	// Clamp network before evaluation to ensure stability
 	autoClampIfInf(bp, float64(minClamp), float64(maxClamp))
 
-	sampleContribution := 100.0 / float64(nSamples) // Each sample’s max contribution (e.g., 0.01% for 10,000)
-
+	sampleContribution := 100.0 / float64(nSamples)
 	for i := 0; i < nSamples; i++ {
 		inputs := make(map[int]float64)
 		for px := 0; px < 784; px++ {
@@ -490,60 +465,57 @@ func evaluateAccuracy(bp *phase.Phase, X, Y *mat.Dense) (exactAcc, closeAcc, pro
 		for j := 0; j < 10; j++ {
 			vals[j] = bp.Neurons[bp.OutputNodes[j]].Value
 			if math.IsNaN(vals[j]) || math.IsInf(vals[j], 0) {
-				vals[j] = 0.0 // Reset invalid values
+				vals[j] = 0.0
 			}
 		}
 
 		maxVal := max(vals)
 		if math.IsNaN(maxVal) || maxVal <= 0 {
-			maxVal = 1.0 // Fallback to avoid division by zero
+			maxVal = 1.0
 		}
 
 		actual := int(Y.At(i, 0))
 		pred := argmax(vals)
 		correctVal := vals[actual]
 
-		// Exact Accuracy
 		if pred == actual {
 			correctExact++
-			totalProximity += sampleContribution // Full contribution (e.g., 0.01%)
-			totalClose += 1.0                    // Exact is fully "close"
+			totalProximity += sampleContribution
+			totalClose += 1.0
 		} else {
 			proximityRatio := 0.0
 			closeRatio := 0.0
 			if !math.IsNaN(correctVal) && correctVal >= 0 && maxVal > 0 {
-				// Proximity: % of exact contribution, symmetric higher/lower
 				if correctVal <= maxVal {
-					proximityRatio = correctVal / maxVal // Lower: direct ratio
-				} else if correctVal <= 2.0*maxVal { // Higher: symmetric decay up to 2x maxVal
+					proximityRatio = correctVal / maxVal
+				} else if correctVal <= 2.0*maxVal {
 					proximityRatio = 1.0 - (correctVal-maxVal)/maxVal
 					if proximityRatio < 0 {
-						proximityRatio = 0.0 // Beyond 2x, no contribution
+						proximityRatio = 0.0
 					}
 				}
 
-				// Close: Within ±10% of maxVal, scaled by closeness
 				lowerBound := 0.9 * maxVal
 				upperBound := 1.1 * maxVal
 				if correctVal >= lowerBound && correctVal <= upperBound {
 					if correctVal <= maxVal {
-						closeRatio = (correctVal - lowerBound) / (maxVal - lowerBound) // 0 to 1 within 0.9 to 1.0
+						closeRatio = (correctVal - lowerBound) / (maxVal - lowerBound)
 					} else {
-						closeRatio = (upperBound - correctVal) / (upperBound - maxVal) // 1 to 0 within 1.0 to 1.1
+						closeRatio = (upperBound - correctVal) / (upperBound - maxVal)
 					}
 					if closeRatio < 0 {
-						closeRatio = 0.0 // Safeguard
+						closeRatio = 0.0
 					}
 				}
 			}
-			totalProximity += proximityRatio * sampleContribution // Partial contribution (e.g., 5% for 10 samples)
-			totalClose += closeRatio                              // Add closeness percentage
+			totalProximity += proximityRatio * sampleContribution
+			totalClose += closeRatio
 		}
 	}
 
 	exactAcc = float64(correctExact) / float64(nSamples)
-	closeAcc = totalClose / float64(nSamples) // Average closeness as percentage
-	proximityScore = totalProximity           // Percentage out of 100%
+	closeAcc = totalClose / float64(nSamples)
+	proximityScore = totalProximity
 	if math.IsNaN(proximityScore) || math.IsInf(proximityScore, 0) {
 		proximityScore = 0.0
 	}
@@ -553,7 +525,6 @@ func evaluateAccuracy(bp *phase.Phase, X, Y *mat.Dense) (exactAcc, closeAcc, pro
 	return exactAcc, closeAcc, proximityScore
 }
 
-// max: returns the maximum value in a slice
 func max(vals []float64) float64 {
 	maxVal := vals[0]
 	for _, v := range vals {
@@ -564,7 +535,6 @@ func max(vals []float64) float64 {
 	return maxVal
 }
 
-// getNeuronRangeByComplexity uses constants to return (min, max) for the given complexity.
 func getNeuronRangeByComplexity(complexity int) (int, int) {
 	switch complexity {
 	case 1:
@@ -574,121 +544,100 @@ func getNeuronRangeByComplexity(complexity int) (int, int) {
 	case 3:
 		return Complexity3MinNeurons, Complexity3MaxNeurons
 	default:
-		// For complexity > 3, either keep it the same or scale up
 		minN := 10 * complexity
 		maxN := 50 * complexity
 		return minN, maxN
 	}
 }
 
-// mutate includes code to add multiple neurons depending on complexity
 func mutate(bp *phase.Phase, mRate float64, complexity int) {
-
 	beforeNeurons := make(map[int]struct{}, len(bp.Neurons))
 	for id := range bp.Neurons {
 		beforeNeurons[id] = struct{}{}
 	}
 
-	// Possibly add multiple neurons if rand triggers
-	if rand.Float64() < mRate {
+	switch rand.Intn(12) {
+	case 0:
 		nMin, nMax := getNeuronRangeByComplexity(complexity)
 		if nMax < nMin {
 			nMax = nMin
 		}
 		numNewNeurons := rand.Intn(nMax-nMin+1) + nMin
-
 		fmt.Printf("  => Complexity %d, adding %d new neurons\n", complexity, numNewNeurons)
 		for i := 0; i < numNewNeurons; i++ {
 			bp.AddRandomNeuron("", "", complexity, complexity+2)
 			bp.RewireOutputsThroughNewNeuron(bp.GetNextNeuronID() - 1)
 		}
-	}
-
-	if rand.Float64() < mRate {
+	case 1:
 		bp.AddConnection()
-	}
-	if rand.Float64() < mRate {
+	case 2:
 		bp.RemoveConnection()
-	}
-	if rand.Float64() < mRate {
+	case 3:
 		bp.AdjustWeights()
-	}
-	if rand.Float64() < mRate {
+	case 4:
 		bp.AdjustBiases()
-	}
-	if rand.Float64() < mRate {
+	case 5:
 		bp.ChangeActivationFunction()
-	}
-
-	// New mutations: adjust all weights and biases slightly
-	if rand.Float64() < mRate {
-		weightAdjustment := rand.NormFloat64() * 0.01 // Small random adjustment
-		bp.AdjustAllWeights(weightAdjustment)
-	}
-
-	if rand.Float64() < mRate {
-		biasAdjustment := rand.NormFloat64() * 0.01 // Small random adjustment
-		bp.AdjustAllBiases(biasAdjustment)
-	}
-
-	// New neuron type mutations
-	if rand.Float64() < mRate {
+	case 6:
+		bp.AdjustAllWeights(rand.NormFloat64() * 0.01)
+	case 7:
+		bp.AdjustAllBiases(rand.NormFloat64() * 0.01)
+	case 8:
 		bp.ChangeSingleNeuronType()
-	}
-	if rand.Float64() < mRate {
-		bp.ChangePercentageOfNeuronsTypes(10.0) // Change 10% of neurons
-	}
-	if rand.Float64() < mRate {
+	case 9:
+		bp.ChangePercentageOfNeuronsTypes(10.0)
+	case 10:
 		bp.RandomizeAllNeuronsTypes()
-	}
-	if rand.Float64() < mRate {
+	case 11:
 		bp.SetAllNeuronsToSameRandomType()
 	}
 
-	// Step 3: Capture the "after" state of neuron IDs
 	afterNeurons := make([]int, 0, len(bp.Neurons))
 	for id := range bp.Neurons {
 		afterNeurons = append(afterNeurons, id)
 	}
 
-	// Step 4: Identify new neurons (those in afterNeurons but not in beforeNeurons)
 	newNeurons := []int{}
 	for _, id := range afterNeurons {
-		if _, exists := beforeNeurons[id]; !exists {
+		if _, existed := beforeNeurons[id]; !existed {
 			newNeurons = append(newNeurons, id)
 		}
 	}
-
-	// Step 5: Set TrainableNeurons to the list of new neurons
 	bp.TrainableNeurons = newNeurons
 }
 
-func selectTopPerformers(pop []*phase.Phase, fit []float64, frac float64) []*phase.Phase {
+func selectTopPerformers(pop []*phase.Phase, exactAccs, closeAccs, proximityScores []float64, frac float64) []*phase.Phase {
 	numSelect := int(float64(len(pop)) * frac)
-	type pf struct {
-		idx int
-		val float64
+	type modelScore struct {
+		idx            int
+		exactAcc       float64
+		closeAcc       float64
+		proximityScore float64
 	}
-	pairs := make([]pf, len(fit))
-	for i, f := range fit {
-		if math.IsNaN(f) || math.IsInf(f, 0) {
-			f = 0.0 // Treat invalid fitness as 0
+	scores := make([]modelScore, len(pop))
+	for i := 0; i < len(pop); i++ {
+		scores[i] = modelScore{i, exactAccs[i], closeAccs[i], proximityScores[i]}
+	}
+	sort.Slice(scores, func(a, b int) bool {
+		if scores[a].exactAcc != scores[b].exactAcc {
+			return scores[a].exactAcc > scores[b].exactAcc
 		}
-		pairs[i] = pf{i, f}
-	}
-	sort.Slice(pairs, func(a, b int) bool {
-		return pairs[a].val > pairs[b].val
+		if scores[a].closeAcc != scores[b].closeAcc {
+			return scores[a].closeAcc > scores[b].closeAcc
+		}
+		return scores[a].proximityScore > scores[b].proximityScore
 	})
 	selected := make([]*phase.Phase, numSelect)
 	for i := 0; i < numSelect; i++ {
-		selected[i] = pop[pairs[i].idx].Copy()
+		selected[i] = pop[scores[i].idx].Copy()
 	}
 	return selected
 }
 
-func createNextGeneration(parents []*phase.Phase, popSize int, mRate float64, cLevel int) []*phase.Phase {
+func createNextGeneration(parents []*phase.Phase, popSize int, mRate float64, cLevel int, overallBestModel *phase.Phase) []*phase.Phase {
 	out := make([]*phase.Phase, popSize)
-	for i := 0; i < popSize; i++ {
+	out[0] = overallBestModel.Copy() // Preserve best model unchanged
+	for i := 1; i < popSize; i++ {
 		p := parents[rand.Intn(len(parents))]
 		child := p.Copy()
 		mutate(child, mRate, cLevel)
@@ -702,7 +651,7 @@ func maxFitness(fit []float64) (float64, int) {
 	bestIdx := 0
 	for i := 1; i < len(fit); i++ {
 		if math.IsNaN(fit[i]) || math.IsInf(fit[i], 0) {
-			fit[i] = 0.0 // Invalid fitness treated as 0
+			fit[i] = 0.0
 		}
 		if fit[i] > bestVal {
 			bestVal = fit[i]
@@ -717,7 +666,7 @@ func argmax(arr []float64) int {
 	bestV := arr[0]
 	for i := 1; i < len(arr); i++ {
 		if math.IsNaN(arr[i]) || math.IsInf(arr[i], 0) {
-			continue // Skip invalid values
+			continue
 		}
 		if arr[i] > bestV {
 			bestV = arr[i]
@@ -816,8 +765,6 @@ func saveResults(r Results, fname string) error {
 	return os.WriteFile(filepath.Join(saveFolder, fname), data, 0644)
 }
 
-// autoClampIfInf scans all neurons. If it detects NaN or ±Inf in any neuron's value,
-// it clamps *all* neuron values, biases, and weights to [minVal..maxVal].
 func autoClampIfInf(bp *phase.Phase, minVal, maxVal float64) {
 	needsClamp := false
 	for _, neuron := range bp.Neurons {
@@ -832,7 +779,6 @@ func autoClampIfInf(bp *phase.Phase, minVal, maxVal float64) {
 	fmt.Println("Auto clamp triggered due to Inf/NaN neuron values. Clamping all to range:", minVal, maxVal)
 
 	for _, neuron := range bp.Neurons {
-		// Clamp main value
 		if math.IsNaN(neuron.Value) || math.IsInf(neuron.Value, 0) {
 			neuron.Value = 0
 		}
@@ -842,7 +788,6 @@ func autoClampIfInf(bp *phase.Phase, minVal, maxVal float64) {
 			neuron.Value = minVal
 		}
 
-		// If LSTM, clamp cell state
 		if math.IsNaN(neuron.CellState) || math.IsInf(neuron.CellState, 0) {
 			neuron.CellState = 0
 		}
@@ -852,7 +797,6 @@ func autoClampIfInf(bp *phase.Phase, minVal, maxVal float64) {
 			neuron.CellState = minVal
 		}
 
-		// Clamp bias
 		if math.IsNaN(neuron.Bias) || math.IsInf(neuron.Bias, 0) {
 			neuron.Bias = 0
 		}
@@ -862,7 +806,6 @@ func autoClampIfInf(bp *phase.Phase, minVal, maxVal float64) {
 			neuron.Bias = minVal
 		}
 
-		// Clamp weights
 		for i := range neuron.Connections {
 			w := neuron.Connections[i][1]
 			if math.IsNaN(w) || math.IsInf(w, 0) {
@@ -877,5 +820,3 @@ func autoClampIfInf(bp *phase.Phase, minVal, maxVal float64) {
 		}
 	}
 }
-
-// checkAndClamp is now replaced by more frequent autoClampIfInf calls
