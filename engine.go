@@ -501,25 +501,25 @@ func evaluateAccuracy(bp *phase.Phase, X, Y *mat.Dense) (exactAcc, closeAcc, pro
 
 		actual := int(Y.At(i, 0))
 		pred := argmax(vals)
+		correctVal := vals[actual]
+
 		if pred == actual {
 			correctExact++
+			correctClose++                       // Exact predictions are always "close" (correctVal = maxVal >= 0.9 * maxVal)
 			totalProximity += sampleContribution // Full contribution for exact match
 		} else {
-			correctVal := vals[actual]
 			proximityRatio := 0.0
 			if !math.IsNaN(correctVal) && correctVal >= 0 && maxVal > 0 {
-				if correctVal <= maxVal {
-					proximityRatio = correctVal / maxVal // Lower than max
-				} else {
-					proximityRatio = maxVal / correctVal // Higher than max, invert to scale down
+				proximityRatio = correctVal / maxVal
+				if proximityRatio > 1 {
+					proximityRatio = 1.0 // Cap at 1.0, no over-reward
 				}
 			}
 			totalProximity += proximityRatio * sampleContribution // Partial contribution
-		}
 
-		correctVal := vals[actual]
-		if !math.IsNaN(correctVal) && correctVal >= closeThreshold*maxVal {
-			correctClose++
+			if !math.IsNaN(correctVal) && correctVal >= closeThreshold*maxVal {
+				correctClose++ // Non-exact but close enough
+			}
 		}
 	}
 
