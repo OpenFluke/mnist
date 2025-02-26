@@ -42,12 +42,12 @@ const (
 	resultsFile = "results.json"
 
 	stagnationCounterMax  = 5
-	Complexity1MinNeurons = 10
-	Complexity1MaxNeurons = 30
-	Complexity2MinNeurons = 50
-	Complexity2MaxNeurons = 80
-	Complexity3MinNeurons = 100
-	Complexity3MaxNeurons = 500
+	Complexity1MinNeurons = 100
+	Complexity1MaxNeurons = 300
+	Complexity2MinNeurons = 500
+	Complexity2MaxNeurons = 800
+	Complexity3MinNeurons = 1000
+	Complexity3MaxNeurons = 5000
 
 	maxClamp = 1000
 	minClamp = -1000
@@ -56,6 +56,10 @@ const (
 
 	// Default split: 80% training, 20% testing
 	trainPercentage = 0.8
+
+	// Connection settings for new neurons
+	minConnections = 5  // Minimum incoming connections per new neuron
+	maxConnections = 15 // Maximum incoming connections per new neuron
 )
 
 // EvolutionaryState holds the overall evolutionary process state
@@ -605,7 +609,7 @@ func mutate(bp *phase.Phase, mRate float64, complexity int) {
 		numNewNeurons := rand.Intn(nMax-nMin+1) + nMin
 		fmt.Printf("  => Complexity %d, adding %d new neurons\n", complexity, numNewNeurons)
 		for i := 0; i < numNewNeurons; i++ {
-			bp.AddRandomNeuron("", "", complexity, complexity+2)
+			bp.AddRandomNeuron("", "", complexity+minConnections, maxConnections+complexity+2)
 			bp.RewireOutputsThroughNewNeuron(bp.GetNextNeuronID() - 1)
 		}
 	case 1:
