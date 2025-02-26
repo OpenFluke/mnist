@@ -26,9 +26,6 @@ const (
 	baseURL  = "https://storage.googleapis.com/cvdf-datasets/mnist/"
 	mnistDir = "mnist_data"
 
-	trainLimit = 3000
-	testLimit  = 1000
-
 	// Evolution hyperparameters
 	populationSize      = 50
 	numGenerations      = 500
@@ -56,6 +53,9 @@ const (
 	minClamp = -1000
 
 	closeThreshold = 0.9
+
+	// Default split: 80% training, 20% testing
+	trainPercentage = 0.8
 )
 
 // EvolutionaryState holds the overall evolutionary process state
@@ -99,16 +99,56 @@ func main() {
 		log.Fatalf("Failed to ensure MNIST data: %v", err)
 	}
 
-	trainX, trainY, err := loadMNIST(mnistDir, "train-images-idx3-ubyte", "train-labels-idx1-ubyte", trainLimit)
+	// Load full training dataset (60,000 images)
+	trainX, trainY, err := loadMNIST(mnistDir, "train-images-idx3-ubyte", "train-labels-idx1-ubyte", 60000)
 	if err != nil {
-		log.Fatalf("Error loading training MNIST: %v", err)
+		log.Fatalf("Error loading full training MNIST: %v", err)
 	}
-	testX, testY, err := loadMNIST(mnistDir, "t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte", testLimit)
+	// Load full testing dataset (10,000 images)
+	testX, testY, err := loadMNIST(mnistDir, "t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte", 10000)
 	if err != nil {
-		log.Fatalf("Error loading testing MNIST: %v", err)
+		log.Fatalf("Error loading full testing MNIST: %v", err)
 	}
 
-	trainTesting(trainX, trainY, testX, testY)
+	// Combine training and testing sets into one dataset (70,000 images)
+	allX := mat.NewDense(70000, 784, nil)
+	allX.Stack(trainX, testX)
+	allY := mat.NewDense(70000, 1, nil)
+	allY.Stack(trainY, testY)
+
+	// Shuffle the combined dataset
+	perm := rand.Perm(70000)
+	shuffledX := mat.NewDense(70000, 784, nil)
+	shuffledY := mat.NewDense(70000, 1, nil)
+	for i, p := range perm {
+		shuffledX.SetRow(i, allX.RawRowView(p))
+		shuffledY.Set(i, 0, allY.At(p, 0))
+	}
+
+	// Option 1: Split by percentage (default 80/20)
+	trainSamples := int(float64(70000) * trainPercentage) // 56,000 for 80%
+	testSamples := 70000 - trainSamples                   // 14,000 for 20%
+
+	// Option 2: Split by specific numbers (uncomment to use)
+	// trainSamples := 50000 // Example: 50,000 training samples
+	// testSamples := 70000 - trainSamples // Remaining 20,000 for testing
+	// if trainSamples+testSamples > 70000 {
+	// 	log.Fatalf("Requested samples (%d train + %d test) exceed total dataset size (70,000)", trainSamples, testSamples)
+	// }
+
+	// Split into training and testing sets
+	newTrainX := mat.NewDense(trainSamples, 784, nil)
+	newTrainY := mat.NewDense(trainSamples, 1, nil)
+	newTestX := mat.NewDense(testSamples, 784, nil)
+	newTestY := mat.NewDense(testSamples, 1, nil)
+
+	newTrainX.Copy(shuffledX.Slice(0, trainSamples, 0, 784))
+	newTrainY.Copy(shuffledY.Slice(0, trainSamples, 0, 1))
+	newTestX.Copy(shuffledX.Slice(trainSamples, 70000, 0, 784))
+	newTestY.Copy(shuffledY.Slice(trainSamples, 70000, 0, 1))
+
+	// Train and test the network
+	trainTesting(newTrainX, newTrainY, newTestX, newTestY)
 	fmt.Println("Done.")
 }
 
