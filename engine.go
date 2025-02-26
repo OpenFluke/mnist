@@ -28,17 +28,17 @@ const (
 	mnistDir = "mnist_data"
 
 	// Adjust these for a quick or thorough demonstration
-	trainLimit = 300
-	testLimit  = 100
+	trainLimit = 30000
+	testLimit  = 10000
 
 	// Evolution hyperparameters
 	populationSize      = 100
 	numGenerations      = 500
 	selectionPercentage = 0.3
-	mutationRate        = 0.5
+	mutationRate        = 0.3
 
 	// Training hyperparameters
-	learningRate = 0.001
+	learningRate = 0.01
 	trainEpochs  = 1
 
 	// For saving state
@@ -274,8 +274,8 @@ func trainTesting(trainX, trainY, testX, testY *mat.Dense) {
 			bpCopy := bp
 			go func() {
 				defer wg.Done()
-				fmt.Printf("  -> Training network %d...\n", iCopy)
-				trainNetwork(bpCopy, trainX, trainY, trainEpochs)
+				//fmt.Printf("  -> Training network %d...\n", iCopy)
+				//trainNetwork(bpCopy, trainX, trainY, trainEpochs)
 
 				// Evaluate all metrics
 				exactAcc, closeAcc, proximityScore := evaluateAccuracy(bpCopy, testX, testY)
@@ -461,8 +461,9 @@ func trainNetwork(bp *phase.Phase, X, Y *mat.Dense, epochs int) {
 			//bp.TrainNetworkTargeted(inputs, expected, learningRate, float64(minClamp), float64(maxClamp), bp.TrainableNeurons)
 
 			// 3) Immediate clamping to prevent propagation of NaN/Inf
-			autoClampIfInf(bp, float64(minClamp), float64(maxClamp))
+
 		}
+		autoClampIfInf(bp, float64(minClamp), float64(maxClamp))
 	}
 }
 
