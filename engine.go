@@ -471,13 +471,13 @@ func trainNetwork(bp *phase.Phase, X, Y *mat.Dense, epochs int) {
 func evaluateAccuracy(bp *phase.Phase, X, Y *mat.Dense) (exactAcc, closeAcc, proximityScore float64) {
 	nSamples, _ := X.Dims()
 	correctExact := 0
-	correctClose := 0
+	totalClose := 0.0 // Sum of closeness percentages
 	totalProximity := 0.0
 
 	// Clamp network before evaluation to ensure stability
 	autoClampIfInf(bp, float64(minClamp), float64(maxClamp))
 
-	sampleContribution := 100.0 / float64(nSamples) // Each sample’s max contribution to exact accuracy
+	sampleContribution := 100.0 / float64(nSamples) // Each sample’s max contribution (e.g., 0.01% for 10,000)
 
 	for i := 0; i < nSamples; i++ {
 		inputs := make(map[int]float64)
@@ -503,31 +503,52 @@ func evaluateAccuracy(bp *phase.Phase, X, Y *mat.Dense) (exactAcc, closeAcc, pro
 		pred := argmax(vals)
 		correctVal := vals[actual]
 
+		// Exact Accuracy
 		if pred == actual {
 			correctExact++
-			correctClose++                       // Exact predictions are always "close" (correctVal = maxVal >= 0.9 * maxVal)
-			totalProximity += sampleContribution // Full contribution for exact match
+			totalProximity += sampleContribution // Full contribution (e.g., 0.01%)
+			totalClose += 1.0                    // Exact is fully "close"
 		} else {
 			proximityRatio := 0.0
+			closeRatio := 0.0
 			if !math.IsNaN(correctVal) && correctVal >= 0 && maxVal > 0 {
-				proximityRatio = correctVal / maxVal
-				if proximityRatio > 1 {
-					proximityRatio = 1.0 // Cap at 1.0, no over-reward
+				// Proximity: % of exact contribution, symmetric higher/lower
+				if correctVal <= maxVal {
+					proximityRatio = correctVal / maxVal // Lower: direct ratio
+				} else if correctVal <= 2.0*maxVal { // Higher: symmetric decay up to 2x maxVal
+					proximityRatio = 1.0 - (correctVal-maxVal)/maxVal
+					if proximityRatio < 0 {
+						proximityRatio = 0.0 // Beyond 2x, no contribution
+					}
+				}
+
+				// Close: Within ±10% of maxVal, scaled by closeness
+				lowerBound := 0.9 * maxVal
+				upperBound := 1.1 * maxVal
+				if correctVal >= lowerBound && correctVal <= upperBound {
+					if correctVal <= maxVal {
+						closeRatio = (correctVal - lowerBound) / (maxVal - lowerBound) // 0 to 1 within 0.9 to 1.0
+					} else {
+						closeRatio = (upperBound - correctVal) / (upperBound - maxVal) // 1 to 0 within 1.0 to 1.1
+					}
+					if closeRatio < 0 {
+						closeRatio = 0.0 // Safeguard
+					}
 				}
 			}
-			totalProximity += proximityRatio * sampleContribution // Partial contribution
-
-			if !math.IsNaN(correctVal) && correctVal >= closeThreshold*maxVal {
-				correctClose++ // Non-exact but close enough
-			}
+			totalProximity += proximityRatio * sampleContribution // Partial contribution (e.g., 5% for 10 samples)
+			totalClose += closeRatio                              // Add closeness percentage
 		}
 	}
 
 	exactAcc = float64(correctExact) / float64(nSamples)
-	closeAcc = float64(correctClose) / float64(nSamples)
-	proximityScore = totalProximity // Percentage out of 100%
+	closeAcc = totalClose / float64(nSamples) // Average closeness as percentage
+	proximityScore = totalProximity           // Percentage out of 100%
 	if math.IsNaN(proximityScore) || math.IsInf(proximityScore, 0) {
-		proximityScore = 0.0 // Final safeguard
+		proximityScore = 0.0
+	}
+	if math.IsNaN(closeAcc) || math.IsInf(closeAcc, 0) {
+		closeAcc = 0.0
 	}
 	return exactAcc, closeAcc, proximityScore
 }
