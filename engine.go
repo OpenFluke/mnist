@@ -28,7 +28,7 @@ const (
 
 	// Evolution hyperparameters
 	populationSize      = 50
-	numGenerations      = 500
+	numGenerations      = 5000
 	selectionPercentage = 0.3
 	mutationRate        = 0.3
 
@@ -42,7 +42,7 @@ const (
 	resultsFile = "results.json"
 
 	stagnationCounterMax  = 5
-	Complexity1MinNeurons = 100
+	Complexity1MinNeurons = 50
 	Complexity1MaxNeurons = 300
 	Complexity2MinNeurons = 500
 	Complexity2MaxNeurons = 800
@@ -58,8 +58,8 @@ const (
 	trainPercentage = 0.8
 
 	// Connection settings for new neurons
-	minConnections = 5  // Minimum incoming connections per new neuron
-	maxConnections = 15 // Maximum incoming connections per new neuron
+	minConnections = 10  // Minimum incoming connections per new neuron
+	maxConnections = 150 // Maximum incoming connections per new neuron
 )
 
 // EvolutionaryState holds the overall evolutionary process state
@@ -295,114 +295,125 @@ func trainTesting(trainX, trainY, testX, testY *mat.Dense) {
 		stagnationCounter = 0
 	}
 
-	for gen < numGenerations {
-		fmt.Printf("\n=== Generation %d (Complexity Level: %d) ===\n", gen, complexityLevel)
-		fmt.Println(time.Now())
+	batchSize := 10 // You can adjust this to any value between 10 and 20 (or any other size)
 
-		fitness := make([]float64, populationSize)
-		exactAccs := make([]float64, populationSize)
-		closeAccs := make([]float64, populationSize)
-		proximityScores := make([]float64, populationSize)
+for gen < numGenerations {
+    fmt.Printf("\n=== Generation %d (Complexity Level: %d) ===\n", gen, complexityLevel)
+    fmt.Println(time.Now())
 
-		// Reset updated flag at the start of each generation
-		bestModelTracker.mu.Lock()
-		bestModelTracker.updated = false
-		bestModelTracker.mu.Unlock()
+    fitness := make([]float64, populationSize)
+    exactAccs := make([]float64, populationSize)
+    closeAccs := make([]float64, populationSize)
+    proximityScores := make([]float64, populationSize)
 
-		var wg sync.WaitGroup
-		wg.Add(len(population))
-		for i, bp := range population {
-			iCopy := i
-			bpCopy := bp
-			go func() {
-				defer wg.Done()
+    // Reset updated flag at the start of each generation
+    bestModelTracker.mu.Lock()
+    bestModelTracker.updated = false
+    bestModelTracker.mu.Unlock()
 
-				exactAcc, closeAcc, proximityScore := evaluateAccuracy(bpCopy, testX, testY)
-				fitness[iCopy] = (0.5 * exactAcc) + (0.3 * closeAcc) + (0.2 * proximityScore / 100)
-				exactAccs[iCopy] = exactAcc
-				closeAccs[iCopy] = closeAcc
-				proximityScores[iCopy] = proximityScore
+    // Process the population in batches
+    for i := 0; i < len(population); i += batchSize {
+        end := i + batchSize
+        if end > len(population) {
+            end = len(population)
+        }
+        var wg sync.WaitGroup
+        // Launch goroutines for the current batch
+        for j := i; j < end; j++ {
+            wg.Add(1)
+            iCopy := j
+            bpCopy := population[j]
+            go func() {
+                defer wg.Done()
+                exactAcc, closeAcc, proximityScore := evaluateAccuracy(bpCopy, testX, testY)
+                fitness[iCopy] = (0.5 * exactAcc) + (0.3 * closeAcc) + (0.2 * proximityScore / 100)
+                exactAccs[iCopy] = exactAcc
+                closeAccs[iCopy] = closeAcc
+                proximityScores[iCopy] = proximityScore
 
-				fmt.Printf("     Network %d: exact=%.2f%%, close=%.2f%%, proximity=%.2f%%\n",
-					iCopy, exactAcc*100, closeAcc*100, proximityScore)
+                fmt.Printf("     Network %d: exact=%.2f%%, close=%.2f%%, proximity=%.2f%%\n",
+                    iCopy, exactAcc*100, closeAcc*100, proximityScore)
 
-				bestModelTracker.mu.Lock()
-				updateReason := ""
-				if exactAcc > bestModelTracker.bestExactAcc {
-					updateReason = "exact accuracy improved"
-				} else if exactAcc == bestModelTracker.bestExactAcc && closeAcc > bestModelTracker.bestCloseAcc {
-					updateReason = "close accuracy improved"
-				} else if exactAcc == bestModelTracker.bestExactAcc && closeAcc == bestModelTracker.bestCloseAcc && proximityScore > bestModelTracker.bestProximityScore {
-					updateReason = "proximity score improved"
-				}
-				if updateReason != "" {
-					bestModelTracker.overallBestModel = bpCopy.Copy()
-					bestModelTracker.bestExactAcc = exactAcc
-					bestModelTracker.bestCloseAcc = closeAcc
-					bestModelTracker.bestProximityScore = proximityScore
-					bestModelTracker.updated = true
-					fmt.Printf("     => New best model selected (%s): exact=%.2f%%, close=%.2f%%, proximity=%.2f%%\n",
-						updateReason, exactAcc*100, closeAcc*100, proximityScore)
-				}
-				bestModelTracker.mu.Unlock()
-			}()
-		}
-		wg.Wait()
+                bestModelTracker.mu.Lock()
+                updateReason := ""
+                if exactAcc > bestModelTracker.bestExactAcc {
+                    updateReason = "exact accuracy improved"
+                } else if exactAcc == bestModelTracker.bestExactAcc && closeAcc > bestModelTracker.bestCloseAcc {
+                    updateReason = "close accuracy improved"
+                } else if exactAcc == bestModelTracker.bestExactAcc && closeAcc == bestModelTracker.bestCloseAcc && proximityScore > bestModelTracker.bestProximityScore {
+                    updateReason = "proximity score improved"
+                }
+                if updateReason != "" {
+                    bestModelTracker.overallBestModel = bpCopy.Copy()
+                    bestModelTracker.bestExactAcc = exactAcc
+                    bestModelTracker.bestCloseAcc = closeAcc
+                    bestModelTracker.bestProximityScore = proximityScore
+                    bestModelTracker.updated = true
+                    fmt.Printf("     => New best model selected (%s): exact=%.2f%%, close=%.2f%%, proximity=%.2f%%\n",
+                        updateReason, exactAcc*100, closeAcc*100, proximityScore)
+                }
+                bestModelTracker.mu.Unlock()
+            }()
+        }
+        // Wait for the batch to finish before moving to the next batch
+        wg.Wait()
+    }
 
-		currentBest, bestIndex := maxFitness(fitness)
-		fmt.Printf("Best fitness this generation: %.4f (exact=%.2f%%, close=%.2f%%, proximity=%.2f%%)\n",
-			currentBest, exactAccs[bestIndex]*100, closeAccs[bestIndex]*100, proximityScores[bestIndex])
+    currentBest, bestIndex := maxFitness(fitness)
+    fmt.Printf("Best fitness this generation: %.4f (exact=%.2f%%, close=%.2f%%, proximity=%.2f%%)\n",
+        currentBest, exactAccs[bestIndex]*100, closeAccs[bestIndex]*100, proximityScores[bestIndex])
 
-		if err := saveModel(population[bestIndex], gen, currentBest, currentBest > bestFitness); err != nil {
-			log.Printf("Failed to save model (gen %d): %v", gen, err)
-		}
+    if err := saveModel(population[bestIndex], gen, currentBest, currentBest > bestFitness); err != nil {
+        log.Printf("Failed to save model (gen %d): %v", gen, err)
+    }
 
-		if currentBest >= 0.9999 {
-			bestFitness = currentBest
-			if bestModelTracker.overallBestModel == nil {
-				bestModelTracker.overallBestModel = population[bestIndex].Copy()
-			}
-			fmt.Printf("Reached near-perfect fitness; stopping at generation %d.\n", gen)
-			finishAndExit(population, gen+1, bestFitness, complexityLevel, stagnationCounter,
-				bestModelTracker.overallBestModel, trainX, trainY, testX, testY)
-			return
-		}
+    if currentBest >= 0.9999 {
+        bestFitness = currentBest
+        if bestModelTracker.overallBestModel == nil {
+            bestModelTracker.overallBestModel = population[bestIndex].Copy()
+        }
+        fmt.Printf("Reached near-perfect fitness; stopping at generation %d.\n", gen)
+        finishAndExit(population, gen+1, bestFitness, complexityLevel, stagnationCounter,
+            bestModelTracker.overallBestModel, trainX, trainY, testX, testY)
+        return
+    }
 
-		// Evolution: Always create next generation from top performers, including best model
-		selected := selectTopPerformers(population, exactAccs, closeAccs, proximityScores, selectionPercentage)
-		population = createNextGeneration(selected, populationSize, mutationRate, complexityLevel, bestModelTracker.overallBestModel)
+    // Evolution: Always create next generation from top performers, including best model
+    selected := selectTopPerformers(population, exactAccs, closeAccs, proximityScores, selectionPercentage)
+    population = createNextGeneration(selected, populationSize, mutationRate, complexityLevel, bestModelTracker.overallBestModel)
 
-		bestModelTracker.mu.Lock()
-		if bestModelTracker.updated {
-			bestFitness = currentBest
-			stagnationCounter = 0
-			fmt.Printf("  => Improvement! New best model with exact=%.2f%%, close=%.2f%%, proximity=%.2f%%\n",
-				bestModelTracker.bestExactAcc*100, bestModelTracker.bestCloseAcc*100, bestModelTracker.bestProximityScore)
-			bestModelTracker.updated = false
-		} else {
-			stagnationCounter++
-			fmt.Printf("  => No improvement. Stagnation %d/%d\n", stagnationCounter, stagnationCounterMax)
-			if stagnationCounter >= stagnationCounterMax {
-				complexityLevel++
-				stagnationCounter = 0
-				fmt.Printf("  => Complexity raised to %d\n", complexityLevel)
-			}
-		}
-		bestModelTracker.mu.Unlock()
+    bestModelTracker.mu.Lock()
+    if bestModelTracker.updated {
+        bestFitness = currentBest
+        stagnationCounter = 0
+        fmt.Printf("  => Improvement! New best model with exact=%.2f%%, close=%.2f%%, proximity=%.2f%%\n",
+            bestModelTracker.bestExactAcc*100, bestModelTracker.bestCloseAcc*100, bestModelTracker.bestProximityScore)
+        bestModelTracker.updated = false
+    } else {
+        stagnationCounter++
+        fmt.Printf("  => No improvement. Stagnation %d/%d\n", stagnationCounter, stagnationCounterMax)
+        if stagnationCounter >= stagnationCounterMax {
+            complexityLevel++
+            stagnationCounter = 0
+            fmt.Printf("  => Complexity raised to %d\n", complexityLevel)
+        }
+    }
+    bestModelTracker.mu.Unlock()
 
-		st := EvolutionaryState{
-			Population:        population,
-			Generation:        gen + 1,
-			BestFitness:       bestFitness,
-			ComplexityLevel:   complexityLevel,
-			StagnationCounter: stagnationCounter,
-		}
-		if err := saveState(st, stateFile); err != nil {
-			log.Printf("Failed to save state: %v", err)
-		}
+    st := EvolutionaryState{
+        Population:        population,
+        Generation:        gen + 1,
+        BestFitness:       bestFitness,
+        ComplexityLevel:   complexityLevel,
+        StagnationCounter: stagnationCounter,
+    }
+    if err := saveState(st, stateFile); err != nil {
+        log.Printf("Failed to save state: %v", err)
+    }
 
-		gen++
-	}
+    gen++
+}
+
 
 	if bestModelTracker.overallBestModel != nil {
 		trainExact, trainClose, trainProx := evaluateAccuracy(bestModelTracker.overallBestModel, trainX, trainY)
