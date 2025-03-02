@@ -43,12 +43,12 @@ const (
 	resultsFile = "results.json"
 
 	stagnationCounterMax  = 5
-	Complexity1MinNeurons = 5
-	Complexity1MaxNeurons = 30
-	Complexity2MinNeurons = 50
-	Complexity2MaxNeurons = 80
-	Complexity3MinNeurons = 100
-	Complexity3MaxNeurons = 500
+	Complexity1MinNeurons = 1
+	Complexity1MaxNeurons = 15
+	Complexity2MinNeurons = 2
+	Complexity2MaxNeurons = 20
+	Complexity3MinNeurons = 3
+	Complexity3MaxNeurons = 60
 
 	maxClamp = 1000
 	minClamp = -1000
@@ -64,6 +64,9 @@ const (
 
 	rushModeEnabled = true
 	rushThreshold   = 0.6
+
+	// New constant for targeted mutation
+	maxAttempts = 3 // Maximum attempts to improve on a batch
 )
 
 // EvolutionaryState holds the overall evolutionary process state
@@ -739,8 +742,22 @@ func createNextGeneration(parents []*phase.Phase, popSize int, mRate float64, cL
 			continue
 		}
 
-		idx := unknownIndices[rand.Intn(len(unknownIndices))]
-		bestChild := performTargetedMutation(overallBestModel, idx, testX, testY, mRate, cLevel)
+		// Select a batch of up to 5 unknown samples
+		batchSize := 5
+		if len(unknownIndices) < batchSize {
+			batchSize = len(unknownIndices)
+		}
+		batch := make([]int, batchSize)
+		// Randomly select without replacement to avoid duplicates
+		perm := rand.Perm(len(unknownIndices))
+		for j := 0; j < batchSize; j++ {
+			batch[j] = unknownIndices[perm[j]]
+		}
+
+		// Perform targeted mutation on the batch
+		bestChild := performTargetedMutation(overallBestModel, batch, testX, testY, mRate, cLevel)
+
+		// Ensure overall exact accuracy doesn't decline
 		originalExact, _, _ := evaluateAccuracy(overallBestModel, testX, testY)
 		newExact, _, _ := evaluateAccuracy(bestChild, testX, testY)
 		if newExact >= originalExact {
@@ -748,18 +765,30 @@ func createNextGeneration(parents []*phase.Phase, popSize int, mRate float64, cL
 		} else {
 			out[i] = overallBestModel.Copy()
 		}
+
+		// Update knownSamples based on the bestChild's performance on the batch
+		for _, idx := range batch {
+			inputs := make(map[int]float64)
+			for px := 0; px < 784; px++ {
+				inputs[bestChild.InputNodes[px]] = testX.At(idx, px)
+			}
+			bestChild.RunNetwork(inputs, 1)
+			vals := make([]float64, 10)
+			for k := 0; k < 10; k++ {
+				vals[k] = bestChild.Neurons[bestChild.OutputNodes[k]].Value
+			}
+			pred := argmax(vals)
+			actual := int(testY.At(idx, 0))
+			if pred == actual {
+				knownSamples[idx] = true
+			}
+		}
 	}
 
 	return out
 }
 
-func performTargetedMutation(bp *phase.Phase, sampleIdx int, testX, testY *mat.Dense, mRate float64, cLevel int) *phase.Phase {
-	inputs := make(map[int]float64)
-	for px := 0; px < 784; px++ {
-		inputs[bp.InputNodes[px]] = testX.At(sampleIdx, px)
-	}
-	actual := int(testY.At(sampleIdx, 0))
-
+func performTargetedMutation(bp *phase.Phase, sampleIndices []int, testX, testY *mat.Dense, mRate float64, cLevel int) *phase.Phase {
 	type MutationResult struct {
 		model *phase.Phase
 		score float64
@@ -772,39 +801,92 @@ func performTargetedMutation(bp *phase.Phase, sampleIdx int, testX, testY *mat.D
 		numGoroutines = 1
 	}
 
-	results := make(chan MutationResult, numGoroutines)
-	var wg sync.WaitGroup
+	// Current best model
+	bestModel := bp.Copy()
+	currentBatch := make([]int, len(sampleIndices))
+	copy(currentBatch, sampleIndices)
 
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			candidate := bp.Copy()
-			mutate(candidate, mRate, cLevel)
-			candidate.RunNetwork(inputs, 1)
-			newVals := make([]float64, 10)
-			for k := 0; k < 10; k++ {
-				newVals[k] = candidate.Neurons[candidate.OutputNodes[k]].Value
+	// Track correctly classified samples in the batch
+	batchKnown := make(map[int]bool)
+
+	// Up to 3 attempts to improve on the batch
+	for attempt := 0; attempt < maxAttempts && len(currentBatch) > 0; attempt++ {
+		results := make(chan MutationResult, numGoroutines)
+		var wg sync.WaitGroup
+
+		// Generate mutations
+		for i := 0; i < numGoroutines; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				candidate := bestModel.Copy()
+				mutate(candidate, mRate, cLevel)
+				score := 0.0
+				// Compute score as the sum of correct class outputs for remaining samples
+				for _, idx := range currentBatch {
+					inputs := make(map[int]float64)
+					for px := 0; px < 784; px++ {
+						inputs[candidate.InputNodes[px]] = testX.At(idx, px)
+					}
+					candidate.RunNetwork(inputs, 1)
+					actual := int(testY.At(idx, 0))
+					score += candidate.Neurons[candidate.OutputNodes[actual]].Value
+				}
+				results <- MutationResult{candidate, score}
+			}()
+		}
+
+		wg.Wait()
+		close(results)
+
+		// Find the best mutation
+		bestScore := math.Inf(-1)
+		var candidateBest *phase.Phase
+		for res := range results {
+			if res.score > bestScore {
+				bestScore = res.score
+				candidateBest = res.model
 			}
-			newScore := newVals[actual]
-			results <- MutationResult{candidate, newScore}
-		}()
-	}
+		}
+		if candidateBest == nil {
+			break // No valid mutations; exit early
+		}
 
-	wg.Wait()
-	close(results)
+		// Evaluate the candidate on the current batch
+		improved := false
+		for i := 0; i < len(currentBatch); i++ {
+			idx := currentBatch[i]
+			inputs := make(map[int]float64)
+			for px := 0; px < 784; px++ {
+				inputs[candidateBest.InputNodes[px]] = testX.At(idx, px)
+			}
+			candidateBest.RunNetwork(inputs, 1)
+			vals := make([]float64, 10)
+			for k := 0; k < 10; k++ {
+				vals[k] = candidateBest.Neurons[candidateBest.OutputNodes[k]].Value
+			}
+			pred := argmax(vals)
+			actual := int(testY.At(idx, 0))
+			if pred == actual && !batchKnown[idx] {
+				batchKnown[idx] = true
+				improved = true
+				// Remove this sample from the batch
+				currentBatch = append(currentBatch[:i], currentBatch[i+1:]...)
+				i-- // Adjust index after removal
+			}
+		}
 
-	bestScore := math.Inf(-1)
-	var bestModel *phase.Phase
-	for res := range results {
-		if res.score > bestScore {
-			bestScore = res.score
-			bestModel = res.model
+		// If we improved (correctly classified a new sample), update the best model
+		if improved {
+			bestModel = candidateBest
+		}
+
+		// If the batch is empty (all samples learned), exit early
+		if len(currentBatch) == 0 {
+			break
 		}
 	}
-	if bestModel == nil {
-		return bp.Copy()
-	}
+
 	return bestModel
 }
 
