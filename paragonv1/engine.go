@@ -19,7 +19,7 @@ import (
 const (
 	baseURL                        = "https://storage.googleapis.com/cvdf-datasets/mnist/"
 	mnistDir                       = "mnist_data"
-	batchSize                      = 50     // Adjustable number of networks per generation
+	batchSize                      = 100    // Adjustable number of networks per generation
 	samplePercentage               = 5      // Adjustable sample percentage (1% = 1, 10% = 10)
 	maxNoImprovementForConnections = 10     // Increase connections after this many generations without improvement
 	maxNoImprovementForNeurons     = 20     // Increase neurons per attempt after this many without improvement
@@ -32,7 +32,7 @@ func main() {
 
 	// Step 1: Download MNIST dataset if not already present
 	fmt.Println("Step 1: Ensuring MNIST dataset is downloaded...")
-	bp := phase.NewPhase()
+	bp := phase.NewPhase() // Temporary instance for downloads
 	if err := ensureMNISTDownloads(bp, mnistDir); err != nil {
 		log.Fatalf("Failed to ensure MNIST data: %v", err)
 	}
@@ -67,10 +67,10 @@ func main() {
 
 	// Step 4: Load latest model or create a new one
 	fmt.Println("Step 4: Checking for latest saved model...")
-	bp, latestGen, err := loadLatestModel(bp)
+	var latestGen int
+	bp, latestGen, err = loadLatestModel()
 	if err != nil {
-		log.Printf("No valid saved model found, starting fresh: %v", err)
-		fmt.Println("Step 4: Creating a dummy neural network...")
+		fmt.Println("No saved model found, creating a new neural network...")
 		bp = phase.NewPhaseWithLayers([]int{784, 64, 10}, "relu", "linear")
 		latestGen = 0
 	} else {
@@ -117,14 +117,14 @@ func main() {
 }
 
 // loadLatestModel checks the test folder for the latest model and loads it
-func loadLatestModel(defaultBP *phase.Phase) (*phase.Phase, int, error) {
+func loadLatestModel() (*phase.Phase, int, error) {
 	if err := os.MkdirAll(testDir, os.ModePerm); err != nil {
-		return defaultBP, 0, fmt.Errorf("failed to create test directory: %v", err)
+		return nil, 0, fmt.Errorf("failed to create test directory: %v", err)
 	}
 
 	files, err := os.ReadDir(testDir)
 	if err != nil {
-		return defaultBP, 0, fmt.Errorf("failed to read test directory: %v", err)
+		return nil, 0, fmt.Errorf("failed to read test directory: %v", err)
 	}
 
 	latestGen := -1
@@ -141,17 +141,17 @@ func loadLatestModel(defaultBP *phase.Phase) (*phase.Phase, int, error) {
 	}
 
 	if latestGen == -1 {
-		return defaultBP, 0, nil // No models found
+		return nil, 0, fmt.Errorf("no saved models found")
 	}
 
 	data, err := os.ReadFile(filepath.Join(testDir, latestFile))
 	if err != nil {
-		return defaultBP, 0, fmt.Errorf("failed to read model file %s: %v", latestFile, err)
+		return nil, 0, fmt.Errorf("failed to read model file %s: %v", latestFile, err)
 	}
 
 	bp := phase.NewPhase()
 	if err := bp.DeserializesFromJSON(string(data)); err != nil {
-		return defaultBP, 0, fmt.Errorf("failed to deserialize model from %s: %v", latestFile, err)
+		return nil, 0, fmt.Errorf("failed to deserialize model from %s: %v", latestFile, err)
 	}
 
 	return bp, latestGen, nil
