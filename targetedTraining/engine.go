@@ -414,15 +414,35 @@ func trainTesting(trainX, trainY, testX, testY *mat.Dense) {
 		topModels := selectTopPerformers(population, exactAccs, closeAccs, proximityScores, topPercentage)
 		fmt.Printf("Adjusting top %d models (%.0f%%) with spectrum of adjustments...\n", len(topModels), topPercentage*100)
 
-		// Define the spectrum of adjustments
-		adjustments := generateAdjustments(adjustmentMin, adjustmentMax, adjustmentStep)
+		// Determine rush mode status
+		isRushMode := rushModeEnabled && bestModelTracker.bestExactAcc < rushThreshold
+
+		// Define adjustment ranges based on rush mode
+		var adjMin, adjMax, adjStep float64
+		if isRushMode {
+			adjMin = -0.1 // Wider range for rush mode
+			adjMax = 0.1
+			adjStep = 0.02 // Larger step for more aggressive changes
+		} else {
+			adjMin = -0.05 // Finer range for normal mode
+			adjMax = 0.05
+			adjStep = 0.01
+		}
+		adjustments := generateAdjustments(adjMin, adjMax, adjStep)
 
 		// For each top model, try different adjustments and select the best one
 		for i, model := range topModels {
-			bestAdjustedModel, bestFitnessAdj := findBestAdjustment(model, adjustments, testX, testY)
-			if bestFitnessAdj > fitness[i] {
-				topModels[i] = bestAdjustedModel
-				fmt.Printf("     Model %d improved: fitness %.4f -> %.4f\n", i, fitness[i], bestFitnessAdj)
+			bestAdjustedModel, adjustedFitness, adjustedProximity := findBestAdjustment(model, adjustments, testX, testY, isRushMode)
+			if isRushMode {
+				if adjustedProximity > proximityScores[i] {
+					topModels[i] = bestAdjustedModel
+					fmt.Printf("     Model %d improved: proximity %.4f -> %.4f\n", i, proximityScores[i], adjustedProximity)
+				}
+			} else {
+				if adjustedFitness > fitness[i] {
+					topModels[i] = bestAdjustedModel
+					fmt.Printf("     Model %d improved: fitness %.4f -> %.4f\n", i, fitness[i], adjustedFitness)
+				}
 			}
 		}
 
@@ -503,22 +523,20 @@ func generateAdjustments(min, max, step float64) []float64 {
 
 // findBestAdjustment tests a spectrum of adjustments on weights, biases, or both and returns the best model
 // Result type for adjusted models
-type AdjustmentResult struct {
-	model   *phase.Phase
-	fitness float64
-}
-
-func findBestAdjustment(model *phase.Phase, adjustments []float64, testX, testY *mat.Dense) (*phase.Phase, float64) {
+// findBestAdjustment tests a spectrum of adjustments on weights, biases, or both and returns the best model
+func findBestAdjustment(model *phase.Phase, adjustments []float64, testX, testY *mat.Dense, isRushMode bool) (*phase.Phase, float64, float64) {
 	bestModel := model.Copy()
-	bestFitness := evaluateFitness(model, testX, testY)
+	exactAcc, closeAcc, proximityScore := evaluateAccuracy(model, testX, testY)
+	bestFitness := (0.5 * exactAcc) + (0.3 * closeAcc) + (0.2 * proximityScore / 100)
+	bestProximity := proximityScore
 
 	// Generate tasks
 	var tasks []AdjustmentTask
 	for _, adj := range adjustments {
 		tasks = append(tasks,
-			AdjustmentTask{true, false, adj},
-			AdjustmentTask{false, true, adj},
-			AdjustmentTask{true, true, adj},
+			AdjustmentTask{true, false, adj}, // Adjust weights only
+			AdjustmentTask{false, true, adj}, // Adjust biases only
+			AdjustmentTask{true, true, adj},  // Adjust both
 		)
 	}
 
@@ -545,8 +563,9 @@ func findBestAdjustment(model *phase.Phase, adjustments []float64, testX, testY 
 			if task.adjustBiases {
 				candidate.AdjustAllBiases(task.adjValue)
 			}
-			fitness := evaluateFitness(candidate, testX, testY)
-			results <- AdjustmentResult{candidate, fitness}
+			exactAcc, closeAcc, proximityScore := evaluateAccuracy(candidate, testX, testY)
+			fitness := (0.5 * exactAcc) + (0.3 * closeAcc) + (0.2 * proximityScore / 100)
+			results <- AdjustmentResult{candidate, fitness, proximityScore}
 		}(task)
 	}
 
@@ -554,15 +573,31 @@ func findBestAdjustment(model *phase.Phase, adjustments []float64, testX, testY 
 	wg.Wait()
 	close(results)
 
-	// Find the best
+	// Find the best model
 	for res := range results {
-		if res.fitness > bestFitness {
-			bestFitness = res.fitness
-			bestModel = res.model
+		if isRushMode {
+			if res.proximityScore > bestProximity {
+				bestProximity = res.proximityScore
+				bestFitness = res.fitness
+				bestModel = res.model
+			}
+		} else {
+			if res.fitness > bestFitness {
+				bestFitness = res.fitness
+				bestProximity = res.proximityScore
+				bestModel = res.model
+			}
 		}
 	}
 
-	return bestModel, bestFitness
+	return bestModel, bestFitness, bestProximity
+}
+
+// AdjustmentResult now includes proximityScore
+type AdjustmentResult struct {
+	model          *phase.Phase
+	fitness        float64
+	proximityScore float64
 }
 
 // evaluateFitness calculates the fitness of a model based on its performance on the test set
