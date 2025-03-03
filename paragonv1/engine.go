@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,10 +19,11 @@ import (
 const (
 	baseURL                        = "https://storage.googleapis.com/cvdf-datasets/mnist/"
 	mnistDir                       = "mnist_data"
-	batchSize                      = 100 // Adjustable number of networks per generation
-	samplePercentage               = 1   // Adjustable sample percentage (1% = 1, 10% = 10)
-	maxNoImprovementForConnections = 10  // Increase connections after this many generations without improvement
-	maxNoImprovementForNeurons     = 20  // Increase neurons per attempt after this many without improvement
+	batchSize                      = 50     // Adjustable number of networks per generation
+	samplePercentage               = 5      // Adjustable sample percentage (1% = 1, 10% = 10)
+	maxNoImprovementForConnections = 10     // Increase connections after this many generations without improvement
+	maxNoImprovementForNeurons     = 20     // Increase neurons per attempt after this many without improvement
+	testDir                        = "test" // Directory to save models
 )
 
 func main() {
@@ -62,9 +65,17 @@ func main() {
 	fmt.Printf("Validation set: %d samples\n", len(valData))
 	fmt.Printf("Testing set:    %d samples\n", len(testInputs))
 
-	// Step 4: Create a dummy neural network
-	fmt.Println("Step 4: Creating a dummy neural network...")
-	bp = phase.NewPhaseWithLayers([]int{784, 64, 10}, "relu", "linear")
+	// Step 4: Load latest model or create a new one
+	fmt.Println("Step 4: Checking for latest saved model...")
+	bp, latestGen, err := loadLatestModel(bp)
+	if err != nil {
+		log.Printf("No valid saved model found, starting fresh: %v", err)
+		fmt.Println("Step 4: Creating a dummy neural network...")
+		bp = phase.NewPhaseWithLayers([]int{784, 64, 10}, "relu", "linear")
+		latestGen = 0
+	} else {
+		fmt.Printf("Loaded model from generation %d\n", latestGen)
+	}
 
 	// Convert validation labels to float64
 	valLabelsFloat := make([]float64, len(valLbls))
@@ -77,7 +88,7 @@ func main() {
 	exactAcc, closeAccs, proximity := bp.EvaluateMetrics(valData, valLabelsFloat)
 
 	// Print initial evaluation results
-	fmt.Printf("\nValidation Set Metrics (Initial Network):\n")
+	fmt.Printf("\nValidation Set Metrics (Initial Network at Gen %d):\n", latestGen)
 	fmt.Printf("Exact Accuracy:  %f%%\n", exactAcc)
 	fmt.Printf("Proximity Score: %f\n", proximity)
 	fmt.Println("Close Accuracies at different thresholds:")
@@ -86,9 +97,9 @@ func main() {
 		fmt.Printf("  %d%% Threshold: %f%%\n", threshold, acc)
 	}
 
-	// Step 6: Run 500 generation cycles
-	fmt.Println("\nStep 6: Starting 500 generation cycles of training with batch size", batchSize, "and sample percentage", samplePercentage, "%...")
-	bestBP := runGenerationCycles(bp, valData, valLabelsFloat, 500, batchSize, 5, 1, 10)
+	// Step 6: Run 500 generation cycles starting from latestGen
+	fmt.Println("\nStep 6: Starting 500 generation cycles of training with batch size", batchSize, "and sample percentage", samplePercentage, "% from generation", latestGen+1, "...")
+	bestBP := runGenerationCycles(bp, valData, valLabelsFloat, 500, batchSize, 5, 1, 10, latestGen)
 
 	// Step 7: Final evaluation with the best model
 	fmt.Println("\nStep 7: Final evaluation with the best model after 500 generations...")
@@ -105,8 +116,49 @@ func main() {
 	fmt.Println("\nTraining and evaluation complete.")
 }
 
+// loadLatestModel checks the test folder for the latest model and loads it
+func loadLatestModel(defaultBP *phase.Phase) (*phase.Phase, int, error) {
+	if err := os.MkdirAll(testDir, os.ModePerm); err != nil {
+		return defaultBP, 0, fmt.Errorf("failed to create test directory: %v", err)
+	}
+
+	files, err := os.ReadDir(testDir)
+	if err != nil {
+		return defaultBP, 0, fmt.Errorf("failed to read test directory: %v", err)
+	}
+
+	latestGen := -1
+	var latestFile string
+	for _, file := range files {
+		if !file.IsDir() && strings.HasPrefix(file.Name(), "model_gen") && strings.HasSuffix(file.Name(), ".json") {
+			genStr := strings.TrimPrefix(strings.TrimSuffix(file.Name(), ".json"), "model_gen")
+			gen, err := strconv.Atoi(genStr)
+			if err == nil && gen > latestGen {
+				latestGen = gen
+				latestFile = file.Name()
+			}
+		}
+	}
+
+	if latestGen == -1 {
+		return defaultBP, 0, nil // No models found
+	}
+
+	data, err := os.ReadFile(filepath.Join(testDir, latestFile))
+	if err != nil {
+		return defaultBP, 0, fmt.Errorf("failed to read model file %s: %v", latestFile, err)
+	}
+
+	bp := phase.NewPhase()
+	if err := bp.DeserializesFromJSON(string(data)); err != nil {
+		return defaultBP, 0, fmt.Errorf("failed to deserialize model from %s: %v", latestFile, err)
+	}
+
+	return bp, latestGen, nil
+}
+
 // runGenerationCycles runs the specified number of generation cycles
-func runGenerationCycles(bp *phase.Phase, valData []map[int]float64, valLabels []float64, generations, batchSize, maxAttempts, minConnectionsInitial, maxConnectionsInitial int) *phase.Phase {
+func runGenerationCycles(bp *phase.Phase, valData []map[int]float64, valLabels []float64, generations, batchSize, maxAttempts, minConnectionsInitial, maxConnectionsInitial, startGen int) *phase.Phase {
 	currentBest := bp
 	_, _, bestApprox := currentBest.EvaluateMetrics(valData, valLabels)
 	noImprovementCount := 0
@@ -114,7 +166,7 @@ func runGenerationCycles(bp *phase.Phase, valData []map[int]float64, valLabels [
 	maxConnections := maxConnectionsInitial
 	neuronsPerAttempt := 1
 
-	for gen := 1; gen <= generations; gen++ {
+	for gen := startGen + 1; gen <= generations; gen++ {
 		fmt.Printf("\n=== Generation %d/%d ===\n", gen, generations)
 
 		// Adjust complexity based on no improvement
@@ -150,6 +202,14 @@ func runGenerationCycles(bp *phase.Phase, valData []map[int]float64, valLabels [
 				fmt.Printf("Generation %d: Found improvement\n", gen)
 				fmt.Printf("Current Prox: %f\n", bestApprox)
 				fmt.Printf("New Prox:     %f\n", newApprox)
+
+				// Save the improved model
+				filename := filepath.Join(testDir, fmt.Sprintf("model_gen%d.json", gen))
+				if err := currentBest.SaveToJSON(filename); err != nil {
+					log.Printf("Failed to save model for generation %d: %v", gen, err)
+				} else {
+					fmt.Printf("Saved improved model to %s\n", filename)
+				}
 			} else {
 				fmt.Printf("Generation %d: Improved model found but not better than current best (%f vs %f)\n", gen, newApprox, bestApprox)
 				noImprovementCount++
