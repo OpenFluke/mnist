@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"phase" // Replace with your actual import path, e.g., "github.com/yourusername/phase"
@@ -19,14 +20,18 @@ type Sample struct {
 }
 
 const (
-	baseURL        = "https://storage.googleapis.com/cvdf-datasets/mnist/"
-	mnistDir       = "mnist_data"
-	modelFile      = "saved_model.json"
-	checkpointFile = "saved_checkpoint.json"
-	modelDir       = "models"
+	baseURL           = "https://storage.googleapis.com/cvdf-datasets/mnist/"
+	mnistDir          = "mnist_data"
+	modelFile         = "saved_model.json"
+	checkpointFile    = "saved_checkpoint.json"
+	modelDir          = "models"
+	currentNumModels  = 10
+	useMultithreading = false
 )
 
 var (
+	numCPUs           int
+	numWorkers        int
 	initialCheckpoint []map[int]map[string]interface{}
 	trainSize         int
 	testSize          int
@@ -35,6 +40,13 @@ var (
 	trainInputs       []map[int]float64
 	trainLabels       []int
 	processStartTime  time.Time
+	avgGenTime        time.Duration
+	startGeneration   = 1
+	maxGenerations    = 500
+	layers            = []int{784, 64, 10}
+	hiddenAct         = "relu"
+	outputAct         = "linear"
+	selectedModel     *phase.Phase
 )
 
 func main() {
@@ -42,9 +54,17 @@ func main() {
 	processStartTime = time.Now()
 	fmt.Printf("Process started at %s\n", processStartTime.Format("2006-01-02 15:04:05"))
 	setupMnist()
+	initModel()
+	generation()
 }
 
 func setupMnist() {
+
+	numCPUs = runtime.NumCPU()
+	numWorkers = int(float64(numCPUs) * 0.8)
+	runtime.GOMAXPROCS(numWorkers)
+	fmt.Printf("Using %d workers (80%% of %d CPUs)\n", numWorkers, numCPUs)
+
 	// Load MNIST dataset
 	fmt.Println("Step 1: Ensuring MNIST dataset is downloaded...")
 	bp := phase.NewPhase()
@@ -81,6 +101,76 @@ func setupMnist() {
 	}
 
 	fmt.Printf("Using %d samples for training and %d samples for testing\n", len(trainSamples), len(testSamples))
+}
+
+func initModel() {
+	//will extend this to load/save/pick best init model i suppose later
+	selectedModel = phase.NewPhaseWithLayers(layers, hiddenAct, outputAct)
+}
+
+func generation() {
+	var totalGenTime time.Duration // To accumulate total time across generations
+	genCount := 0                  // To count the number of generations
+
+	for generation := startGeneration; generation <= maxGenerations; generation++ {
+		genStartTime := time.Now()
+		fmt.Printf("\n=== GEN %d started %s\n", generation, genStartTime.Format("2006-01-02 15:04:05"))
+
+		// Simulate some work here (if any) - currently empty in your code
+		training()
+
+		// Calculate generation duration and update total time
+		genDuration := time.Since(genStartTime)
+		totalGenTime += genDuration
+		genCount++
+
+		// Update average generation time
+		avgGenTime = totalGenTime / time.Duration(genCount)
+
+		// Calculate full running time since process start
+		fullRunningTime := time.Since(processStartTime)
+
+		fmt.Printf("=== GEN %d finished. Gen time: %s, Full: %s, Avg: %s\n",
+			generation, genDuration, fullRunningTime, avgGenTime)
+	}
+}
+
+func training() {
+	//var results []phase.ModelResult
+	if useMultithreading {
+		/*jobChan := make(chan int, currentNumModels)
+		resultChan := make(chan phase.ModelResult, currentNumModels)
+
+		for i := 0; i < numWorkers; i++ {
+			go func(workerID int) {
+				for job := range jobChan {
+					resultChan <- evolveModel(bp, trainSamples, checkpoints, job, generation, workerID)
+				}
+			}(i)
+		}
+
+		for i := 0; i < currentNumModels; i++ {
+			jobChan <- i
+		}
+		close(jobChan)
+
+		for i := 0; i < currentNumModels; i++ {
+			results = append(results, <-resultChan)
+		}*/
+	} else {
+		for i := 0; i < currentNumModels; i++ {
+			//results = append(results, evolveModel(bp, trainSamples, checkpoints, i, generation, 0))
+		}
+	}
+}
+
+func grow(originalBP *phase.Phase, samples *[]Sample, workerID int) ModelResult {
+	bestBP := originalBP.Copy()
+
+	var bestExactAcc float64
+	var bestClosenessBins []float64
+	var bestApproxScore float64
+
 }
 
 func OLD() {
