@@ -26,7 +26,8 @@ const (
 	initialNumModels       = 10  // Starting number of models per generation
 	maxNumModels           = 100 // Maximum number of models per generation
 	noImprovementThreshold = 5   // Generations without improvement before increasing models
-	maxIterations          = 25
+	maxIterations          = 10
+	useMultithreading      = false
 )
 
 type Sample struct {
@@ -151,25 +152,34 @@ func main() {
 
 		currentClosenessQuality = computeClosenessQuality(currentClosenessBins)
 
-		jobChan := make(chan int, currentNumModels)
-		resultChan := make(chan ModelResult, currentNumModels)
+		var results []ModelResult
 
-		for i := 0; i < numWorkers; i++ {
-			go func() {
-				for job := range jobChan {
-					resultChan <- evolveModel(bp, trainSamples, checkpoints, job)
-				}
-			}()
-		}
+		// Toggle between multithreaded and single-threaded evolution based on the global variable.
+		if useMultithreading {
+			jobChan := make(chan int, currentNumModels)
+			resultChan := make(chan ModelResult, currentNumModels)
 
-		for i := 0; i < currentNumModels; i++ {
-			jobChan <- i
-		}
-		close(jobChan)
+			for i := 0; i < numWorkers; i++ {
+				go func() {
+					for job := range jobChan {
+						resultChan <- evolveModel(bp, trainSamples, checkpoints, job)
+					}
+				}()
+			}
 
-		results := make([]ModelResult, 0, currentNumModels)
-		for i := 0; i < currentNumModels; i++ {
-			results = append(results, <-resultChan)
+			for i := 0; i < currentNumModels; i++ {
+				jobChan <- i
+			}
+			close(jobChan)
+
+			for i := 0; i < currentNumModels; i++ {
+				results = append(results, <-resultChan)
+			}
+		} else {
+			// Single-threaded mode: run evolution sequentially.
+			for i := 0; i < currentNumModels; i++ {
+				results = append(results, evolveModel(bp, trainSamples, checkpoints, i))
+			}
 		}
 
 		// Tournament selection to find the best model
