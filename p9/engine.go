@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,7 +28,7 @@ const (
 	maxNumModels           = 100 // Maximum number of models per generation
 	noImprovementThreshold = 5   // Generations without improvement before increasing models
 	maxIterations          = 10
-	useMultithreading      = false
+	useMultithreading      = true
 	checkpointBatchSize    = 10                    // Number of checkpoints to load per batch
 	baseCheckpointDir      = "cpcache"             // Base directory for all checkpoints
 	sharedCheckpointSubDir = "current_checkpoints" // Subdirectory for the best model's checkpoints
@@ -52,7 +53,7 @@ var (
 	useFileCheckpoints bool = true // Toggle for file-based checkpointing (default: true)
 )
 
-// computeTotalImprovement calculates the weighted sum of improvements for a model.
+// **computeTotalImprovement** calculates the weighted sum of improvements for a model.
 func computeTotalImprovement(result ModelResult, currentExactAcc, currentClosenessQuality, currentApproxScore float64) float64 {
 	newClosenessQuality := computeClosenessQuality(result.ClosenessBins)
 	deltaExactAcc := result.ExactAcc - currentExactAcc
@@ -73,7 +74,7 @@ func computeTotalImprovement(result ModelResult, currentExactAcc, currentClosene
 		(weightApproxScore * normDeltaApproxScore)
 }
 
-// tournamentSelection selects the best model from a random subset of results.
+// **tournamentSelection** selects the best model from a random subset of results.
 func tournamentSelection(results []ModelResult, currentExactAcc, currentClosenessQuality, currentApproxScore float64, tournamentSize int) ModelResult {
 	if len(results) < tournamentSize {
 		tournamentSize = len(results)
@@ -92,19 +93,55 @@ func tournamentSelection(results []ModelResult, currentExactAcc, currentClosenes
 	return results[bestIdx]
 }
 
+// **findLatestGeneration** finds the highest generation number from saved models.
+func findLatestGeneration() (int, bool) {
+	files, err := os.ReadDir(modelDir)
+	if err != nil {
+		log.Fatalf("Failed to read models directory: %v", err)
+	}
+	maxGen := -1
+	for _, file := range files {
+		if strings.HasPrefix(file.Name(), "gen_") && strings.HasSuffix(file.Name(), ".json") {
+			genStr := strings.TrimSuffix(strings.TrimPrefix(file.Name(), "gen_"), ".json")
+			gen, err := strconv.Atoi(genStr)
+			if err == nil && gen > maxGen {
+				maxGen = gen
+			}
+		}
+	}
+	if maxGen == -1 {
+		return 0, false
+	}
+	return maxGen, true
+}
+
+// **loadModel** loads a model from a JSON file.
+func loadModel(filePath string) (*phase.Phase, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read model file: %v", err)
+	}
+	var bp phase.Phase
+	if err := json.Unmarshal(data, &bp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal model: %v", err)
+	}
+	return &bp, nil
+}
+
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	processStartTime := time.Now()
 	fmt.Printf("Process started at %s\n", processStartTime.Format("2006-01-02 15:04:05"))
 
+	// Ensure directories exist
 	if err := os.MkdirAll(modelDir, 0755); err != nil {
 		log.Fatalf("Failed to create models directory: %v", err)
 	}
-
 	if useFileCheckpoints {
 		if err := os.MkdirAll(baseCheckpointDir, 0755); err != nil {
 			log.Fatalf("Failed to create base checkpoint directory %s: %v", baseCheckpointDir, err)
 		}
+		// Clean up old temporary checkpoint directories, but keep sharedCheckpointSubDir
 		entries, err := os.ReadDir(baseCheckpointDir)
 		if err == nil {
 			for _, entry := range entries {
@@ -120,6 +157,7 @@ func main() {
 
 	checkpointDir := filepath.Join(baseCheckpointDir, sharedCheckpointSubDir)
 
+	// Load MNIST dataset
 	fmt.Println("Step 1: Ensuring MNIST dataset is downloaded...")
 	bp := phase.NewPhase()
 	if err := ensureMNISTDownloads(bp, mnistDir); err != nil {
@@ -140,47 +178,150 @@ func main() {
 	}
 	fmt.Printf("Using %d samples for training and checkpointing\n", len(trainSamples))
 
-	fmt.Println("Step 3: Selecting the best initial neural network from multiple candidates...")
-	numInitialModels := 10
-	layers := []int{784, 64, 10}
-	hiddenAct := "relu"
-	outputAct := "linear"
-	numCPUs := runtime.NumCPU()
-	numWorkers := int(float64(numCPUs) * 0.8)
-	runtime.GOMAXPROCS(numWorkers)
-	fmt.Printf("Using %d workers (80%% of %d CPUs)\n", numWorkers, numCPUs)
+	// Variables to hold the model and its metrics
+	var currentExactAcc float64
+	var currentClosenessBins []float64
+	var currentApproxScore float64
+	var currentClosenessQuality float64
+	var checkpoints []map[int]map[string]interface{}
+	startGeneration := 1
 
-	bp, currentExactAcc, currentClosenessBins, currentApproxScore := selectBestInitialModel(numInitialModels, layers, hiddenAct, outputAct, trainSamples, numWorkers)
-	currentClosenessQuality := computeClosenessQuality(currentClosenessBins)
-	fmt.Println("Selected best initial model with metrics:")
+	// Check for existing generation models
+	latestGen, hasGenModels := findLatestGeneration()
+	if hasGenModels {
+		fmt.Printf("Loading latest generation model (gen_%d.json)...\n", latestGen)
+		modelPath := filepath.Join(modelDir, fmt.Sprintf("gen_%d.json", latestGen))
+		bp, err = loadModel(modelPath)
+		if err != nil {
+			log.Fatalf("Failed to load model from %s: %v", modelPath, err)
+		}
+		startGeneration = latestGen + 1
+
+		// Check if checkpoints are up-to-date
+		latestModelFile := filepath.Join(baseCheckpointDir, "latest_model.txt")
+		data, err := os.ReadFile(latestModelFile)
+		if err == nil && string(data) == fmt.Sprintf("%d", latestGen) {
+			// Checkpoints are up-to-date, proceed with loading metrics
+			fmt.Printf("Using existing checkpoints in %s\n", checkpointDir)
+		} else {
+			// Recompute checkpoints
+			fmt.Println("Checkpoints missing or outdated, recomputing...")
+			if useFileCheckpoints {
+				if err := os.RemoveAll(checkpointDir); err != nil && !os.IsNotExist(err) {
+					log.Printf("Failed to clean up checkpoint directory %s: %v", checkpointDir, err)
+				}
+				if err := bp.SaveCheckpointsToDirectory(getInputs(trainSamples), 1, checkpointDir); err != nil {
+					log.Fatalf("Failed to save checkpoints for loaded model: %v", err)
+				}
+				fmt.Printf("Checkpoints saved to %s\n", checkpointDir)
+				// Update latest_model.txt
+				if err := os.WriteFile(latestModelFile, []byte(fmt.Sprintf("%d", latestGen)), 0644); err != nil {
+					log.Printf("Failed to write latest_model.txt: %v", err)
+				}
+			} else {
+				checkpoints = bp.CheckpointAllHiddenNeurons(getInputs(trainSamples), 1)
+				fmt.Printf("Checkpoints recomputed with %d samples in memory\n", len(checkpoints))
+			}
+		}
+	} else {
+		// No generation models, check for initial_best.json
+		initialModelPath := filepath.Join(modelDir, "initial_best.json")
+		if _, err := os.Stat(initialModelPath); err == nil {
+			fmt.Println("Loading initial best model (initial_best.json)...")
+			bp, err = loadModel(initialModelPath)
+			if err != nil {
+				log.Fatalf("Failed to load initial model from %s: %v", initialModelPath, err)
+			}
+			startGeneration = 1
+
+			// Check if checkpoints are up-to-date
+			latestModelFile := filepath.Join(baseCheckpointDir, "latest_model.txt")
+			data, err := os.ReadFile(latestModelFile)
+			if err == nil && string(data) == "initial" {
+				fmt.Printf("Using existing checkpoints in %s\n", checkpointDir)
+			} else {
+				fmt.Println("Checkpoints missing or outdated, recomputing...")
+				if useFileCheckpoints {
+					if err := os.RemoveAll(checkpointDir); err != nil && !os.IsNotExist(err) {
+						log.Printf("Failed to clean up checkpoint directory %s: %v", checkpointDir, err)
+					}
+					if err := bp.SaveCheckpointsToDirectory(getInputs(trainSamples), 1, checkpointDir); err != nil {
+						log.Fatalf("Failed to save checkpoints for initial model: %v", err)
+					}
+					fmt.Printf("Checkpoints saved to %s\n", checkpointDir)
+					// Update latest_model.txt
+					if err := os.WriteFile(latestModelFile, []byte("initial"), 0644); err != nil {
+						log.Printf("Failed to write latest_model.txt: %v", err)
+					}
+				} else {
+					checkpoints = bp.CheckpointAllHiddenNeurons(getInputs(trainSamples), 1)
+					fmt.Printf("Checkpoints recomputed with %d samples in memory\n", len(checkpoints))
+				}
+			}
+		} else {
+			// No models found, initialize new ones
+			fmt.Println("No saved models found. Step 3: Selecting the best initial neural network from multiple candidates...")
+			numCPUs := runtime.NumCPU()
+			numWorkers := int(float64(numCPUs) * 0.8)
+			runtime.GOMAXPROCS(numWorkers)
+			fmt.Printf("Using %d workers (80%% of %d CPUs)\n", numWorkers, numCPUs)
+
+			layers := []int{784, 64, 10}
+			hiddenAct := "relu"
+			outputAct := "linear"
+			bp, currentExactAcc, currentClosenessBins, currentApproxScore = selectBestInitialModel(initialNumModels, layers, hiddenAct, outputAct, trainSamples, numWorkers)
+			currentClosenessQuality = computeClosenessQuality(currentClosenessBins)
+			fmt.Println("Selected best initial model with metrics:")
+			fmt.Printf("  ExactAcc: %.4f\n", currentExactAcc)
+			fmt.Printf("  ClosenessBins: %v\n", formatClosenessBins(currentClosenessBins))
+			fmt.Printf("  ApproxScore: %.4f\n", currentApproxScore)
+			fmt.Printf("  ClosenessQuality: %.4f\n", currentClosenessQuality)
+
+			if err := saveModel(bp, initialModelPath); err != nil {
+				log.Printf("Failed to save best initial model: %v", err)
+			}
+
+			fmt.Println("Step 4: Creating initial checkpoint with all training data...")
+			if useFileCheckpoints {
+				if err := os.RemoveAll(checkpointDir); err != nil && !os.IsNotExist(err) {
+					log.Printf("Failed to clean up checkpoint directory %s: %v", checkpointDir, err)
+				}
+				if err := bp.SaveCheckpointsToDirectory(getInputs(trainSamples), 1, checkpointDir); err != nil {
+					log.Fatalf("Failed to save initial checkpoints: %v", err)
+				}
+				fmt.Printf("Initial checkpoints saved to %s\n", checkpointDir)
+				// Update latest_model.txt
+				latestModelFile := filepath.Join(baseCheckpointDir, "latest_model.txt")
+				if err := os.WriteFile(latestModelFile, []byte("initial"), 0644); err != nil {
+					log.Printf("Failed to write latest_model.txt: %v", err)
+				}
+			} else {
+				checkpoints = bp.CheckpointAllHiddenNeurons(getInputs(trainSamples), 1)
+				fmt.Printf("Checkpoint created with %d samples in memory\n", len(checkpoints))
+			}
+		}
+	}
+
+	// Compute metrics for the loaded or initial model
+	if useFileCheckpoints {
+		currentExactAcc, currentClosenessBins, currentApproxScore = bp.EvaluateMetricsFromCheckpointDir(checkpointDir, getLabels(trainSamples), checkpointBatchSize)
+	} else {
+		currentExactAcc, currentClosenessBins, currentApproxScore = bp.EvaluateMetricsFromCheckpoints(checkpoints, getLabels(trainSamples))
+	}
+	currentClosenessQuality = computeClosenessQuality(currentClosenessBins)
+	fmt.Printf("Starting with model at generation %d with metrics:\n", startGeneration-1)
 	fmt.Printf("  ExactAcc: %.4f\n", currentExactAcc)
 	fmt.Printf("  ClosenessBins: %v\n", formatClosenessBins(currentClosenessBins))
 	fmt.Printf("  ApproxScore: %.4f\n", currentApproxScore)
 	fmt.Printf("  ClosenessQuality: %.4f\n", currentClosenessQuality)
 
-	if err := saveModel(bp, filepath.Join(modelDir, "initial_best.json")); err != nil {
-		log.Printf("Failed to save best initial model: %v", err)
-	}
-
-	fmt.Println("Step 4: Creating initial checkpoint with all training data...")
-	var checkpoints []map[int]map[string]interface{}
-	if useFileCheckpoints {
-		if err := os.RemoveAll(checkpointDir); err != nil && !os.IsNotExist(err) {
-			log.Printf("Failed to clean up existing checkpoint directory %s: %v", checkpointDir, err)
-		}
-		if err := bp.SaveCheckpointsToDirectory(getInputs(trainSamples), 1, checkpointDir); err != nil {
-			log.Fatalf("Failed to save initial checkpoints: %v", err)
-		}
-		fmt.Printf("Initial checkpoints saved to %s\n", checkpointDir)
-	} else {
-		checkpoints = bp.CheckpointAllHiddenNeurons(getInputs(trainSamples), 1)
-		fmt.Printf("Checkpoint created with %d samples in memory\n", len(checkpoints))
-	}
-
+	// Evolution loop
 	currentNumModels := initialNumModels
 	generationsWithoutImprovement := 0
+	numWorkers := int(float64(runtime.NumCPU()) * 0.8)
+	runtime.GOMAXPROCS(numWorkers)
 
-	for generation := 1; generation <= maxGenerations; generation++ {
+	for generation := startGeneration; generation <= maxGenerations; generation++ {
 		genStartTime := time.Now()
 		fmt.Printf("\n=== Generation %d started at %s with %d models ===\n", generation, genStartTime.Format("2006-01-02 15:04:05"), currentNumModels)
 
@@ -257,6 +398,11 @@ func main() {
 					log.Printf("Failed to save new checkpoints: %v", err)
 				} else {
 					fmt.Printf("New checkpoints saved to %s\n", checkpointDir)
+					// Update latest_model.txt
+					latestModelFile := filepath.Join(baseCheckpointDir, "latest_model.txt")
+					if err := os.WriteFile(latestModelFile, []byte(fmt.Sprintf("%d", generation)), 0644); err != nil {
+						log.Printf("Failed to write latest_model.txt: %v", err)
+					}
 				}
 			} else {
 				fmt.Println("Recreating checkpoint in memory with updated model...")
@@ -283,20 +429,13 @@ func main() {
 		fmt.Printf("Generation %d finished at %s, duration: %.2f seconds\n", generation, genEndTime.Format("2006-01-02 15:04:05"), genDuration)
 	}
 
-	if useFileCheckpoints {
-		if err := os.RemoveAll(checkpointDir); err != nil {
-			log.Printf("Failed to clean up checkpoint directory %s: %v", checkpointDir, err)
-		} else {
-			fmt.Printf("Cleaned up checkpoint directory %s\n", checkpointDir)
-		}
-	}
-
+	// Do not clean up checkpointDir to allow resuming
 	processEndTime := time.Now()
 	totalProcessTime := processEndTime.Sub(processStartTime).Seconds()
 	fmt.Printf("\nProcess finished at %s, total time: %.2f seconds\n", processEndTime.Format("2006-01-02 15:04:05"), totalProcessTime)
 }
 
-// **selectBestInitialModel with unique checkpoint directories per model**
+// **selectBestInitialModel** with unique checkpoint directories per model
 func selectBestInitialModel(numModels int, layers []int, hiddenAct, outputAct string, samples []Sample, numWorkers int) (*phase.Phase, float64, []float64, float64) {
 	type evalResult struct {
 		bp            *phase.Phase
@@ -351,7 +490,7 @@ func selectBestInitialModel(numModels int, layers []int, hiddenAct, outputAct st
 	return bestResult.bp, bestResult.exactAcc, bestResult.closenessBins, bestResult.approxScore
 }
 
-// **evolveModel with unique checkpoint directories for each model**
+// **evolveModel** with unique checkpoint directories for each model
 func evolveModel(originalBP *phase.Phase, samples []Sample, checkpoints []map[int]map[string]interface{}, copyID int, generation int, workerID int) ModelResult {
 	bestBP := originalBP.Copy()
 	bestBP.ID = copyID
