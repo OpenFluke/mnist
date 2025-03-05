@@ -125,6 +125,7 @@ func loadModel(filePath string) (*phase.Phase, error) {
 	if err := json.Unmarshal(data, &bp); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal model: %v", err)
 	}
+	bp.InitializeActivationFunctions() // Initialize activation map
 	return &bp, nil
 }
 
