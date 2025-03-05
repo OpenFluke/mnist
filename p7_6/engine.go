@@ -241,7 +241,7 @@ func evolveModel(originalBP *phase.Phase, samples []Sample, checkpoints []map[in
 	bestClosenessQuality := computeClosenessQuality(bestClosenessBins)
 	neuronsAdded := 0
 
-	maxIterations := 1000
+	maxIterations := 50
 	iterations := 0
 	consecutiveFailures := 0
 	maxConsecutiveFailures := 5
