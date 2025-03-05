@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,7 +23,7 @@ const (
 	epsilon                = 0.001 // Tolerance for floating-point comparisons
 	modelDir               = "models"
 	maxGenerations         = 500
-	initialNumModels       = 50  // Starting number of models per generation
+	initialNumModels       = 10  // Starting number of models per generation
 	maxNumModels           = 100 // Maximum number of models per generation
 	noImprovementThreshold = 5   // Generations without improvement before increasing models
 )
@@ -235,19 +236,22 @@ func evolveModel(originalBP *phase.Phase, samples []Sample, checkpoints []map[in
 	bestBP := originalBP.Copy()
 	bestBP.ID = copyID
 
+	// Initial evaluation
 	bestExactAcc, bestClosenessBins, bestApproxScore := evaluateModelWithCheckpoints(bestBP, samples, checkpoints)
+	bestClosenessQuality := computeClosenessQuality(bestClosenessBins)
 	neuronsAdded := 0
 
 	maxIterations := 1000
 	iterations := 0
 	consecutiveFailures := 0
-	maxConsecutiveFailures := 5 // Stop after 5 failed attempts
+	maxConsecutiveFailures := 5
 
 	for consecutiveFailures < maxConsecutiveFailures && iterations < maxIterations {
 		iterations++
 
+		// Create and modify a copy of the best model
 		currentBP := bestBP.Copy()
-		numToAdd := rand.Intn(10) + 5 // Add 5–15 neurons per attempt
+		numToAdd := rand.Intn(10) + 5 // Add 5–15 neurons
 		for i := 0; i < numToAdd; i++ {
 			newNeuron := currentBP.AddNeuronFromPreOutputs("dense", "", 1, 50)
 			if newNeuron != nil {
@@ -256,26 +260,45 @@ func evolveModel(originalBP *phase.Phase, samples []Sample, checkpoints []map[in
 			}
 		}
 
+		// Evaluate current model
 		newExactAcc, newClosenessBins, newApproxScore := evaluateModelWithCheckpoints(currentBP, samples, checkpoints)
 		newClosenessQuality := computeClosenessQuality(newClosenessBins)
-		bestClosenessQuality := computeClosenessQuality(bestClosenessBins)
 
-		// Check for improvement
-		if newExactAcc > bestExactAcc+epsilon ||
-			newClosenessQuality > bestClosenessQuality+epsilon ||
-			newApproxScore > bestApproxScore+epsilon {
+		// Log metrics for every iteration
+		fmt.Printf("Sandbox %d, Iter %d: eA=%.4f, cQ=%.4f, aS=%.4f, Neurons=%d\n",
+			copyID, iterations, newExactAcc, newClosenessQuality, newApproxScore, neuronsAdded)
+
+		// Check for improvements
+		improvedMetrics := []string{}
+		if newExactAcc > bestExactAcc+epsilon {
+			improvedMetrics = append(improvedMetrics, "eA")
+		}
+		if newClosenessQuality > bestClosenessQuality+epsilon {
+			improvedMetrics = append(improvedMetrics, "cQ")
+		}
+		if newApproxScore > bestApproxScore+epsilon {
+			improvedMetrics = append(improvedMetrics, "aS")
+		}
+
+		// Log if there’s an improvement
+		if len(improvedMetrics) > 0 {
+			fmt.Printf("Sandbox %d: Improvement at Iter %d (%s): eA=%.4f, cQ=%.4f, aS=%.4f, Neurons=%d\n",
+				copyID, iterations, strings.Join(improvedMetrics, ", "), newExactAcc, newClosenessQuality, newApproxScore, neuronsAdded)
+			// Update best model and metrics
 			bestBP = currentBP
 			bestExactAcc = newExactAcc
 			bestClosenessBins = newClosenessBins
+			bestClosenessQuality = newClosenessQuality
 			bestApproxScore = newApproxScore
-			consecutiveFailures = 0 // Reset on improvement
-			fmt.Printf("Sandbox %d: Improvement at iteration %d, ExactAcc: %.4f, NeuronsAdded: %d\n", copyID, iterations, bestExactAcc, neuronsAdded)
+			consecutiveFailures = 0
 		} else {
 			consecutiveFailures++
 		}
 	}
 
-	fmt.Printf("Sandbox %d: Exited after %d iterations, %d consecutive failures, ExactAcc: %.4f\n", copyID, iterations, consecutiveFailures, bestExactAcc)
+	// Final log when exiting
+	fmt.Printf("Sandbox %d: Exited after %d iterations, %d consecutive failures, eA=%.4f, cQ=%.4f, aS=%.4f\n",
+		copyID, iterations, consecutiveFailures, bestExactAcc, bestClosenessQuality, bestApproxScore)
 	return ModelResult{
 		BP:            bestBP,
 		ExactAcc:      bestExactAcc,
