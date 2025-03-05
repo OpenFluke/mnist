@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -15,9 +16,11 @@ import (
 )
 
 const (
-	baseURL  = "https://storage.googleapis.com/cvdf-datasets/mnist/"
-	mnistDir = "mnist_data"
-	epsilon  = 0.01 // Tolerance for floating-point comparisons
+	baseURL   = "https://storage.googleapis.com/cvdf-datasets/mnist/"
+	mnistDir  = "mnist_data"
+	epsilon   = 0.01 // Tolerance for floating-point comparisons
+	modelDir  = "models"
+	numModels = 100 // Number of models to process per generation
 )
 
 type Sample struct {
@@ -33,9 +36,23 @@ type ModelResult struct {
 	NeuronsAdded  int
 }
 
+var (
+	improvedMutex sync.Mutex
+	improved      bool
+)
+
 func main() {
 	// Seed the random number generator.
 	rand.Seed(time.Now().UnixNano())
+
+	// Record process start time.
+	processStartTime := time.Now()
+	fmt.Printf("Process started at %s\n", processStartTime.Format("2006-01-02 15:04:05"))
+
+	// Create models directory.
+	if err := os.MkdirAll(modelDir, 0755); err != nil {
+		log.Fatalf("Failed to create models directory: %v", err)
+	}
 
 	// Step 1: Ensure MNIST is downloaded.
 	fmt.Println("Step 1: Ensuring MNIST dataset is downloaded...")
@@ -52,7 +69,7 @@ func main() {
 	}
 	fmt.Printf("Loaded %d training samples\n", len(trainInputs))
 
-	// Use 80% of the data for training/checkpointing (48,000 samples)
+	// Use 80% of the data for training/checkpointing (48,000 samples).
 	trainSize := int(0.8 * float64(len(trainInputs)))
 	trainSamples := make([]Sample, trainSize)
 	for i := 0; i < trainSize; i++ {
@@ -60,100 +77,133 @@ func main() {
 	}
 	fmt.Printf("Using %d samples for training and checkpointing\n", len(trainSamples))
 
-	// Step 3: Create the initial neural network.
+	// Step 3: Initialize the neural network.
 	fmt.Println("Step 3: Creating the initial neural network...")
 	bp = phase.NewPhaseWithLayers([]int{784, 64, 10}, "relu", "linear")
 	currentExactAcc, currentClosenessBins, currentApproxScore := evaluateModelWithCheckpoints(bp, trainSamples)
-	fmt.Printf("Initial model metrics: ExactAcc=%.4f, ClosenessBins=%v, ApproxScore=%.4f\n",
-		currentExactAcc, formatClosenessBins(currentClosenessBins), currentApproxScore)
+	fmt.Printf("Initial model metrics:\n")
+	fmt.Printf("  ExactAcc: %.4f\n", currentExactAcc)
+	fmt.Printf("  ClosenessBins: %v\n", formatClosenessBins(currentClosenessBins))
+	fmt.Printf("  ApproxScore: %.4f\n", currentApproxScore)
 
-	// Step 4: Create initial checkpoint with all training data (48,000 samples).
+	// Save initial model as gen_0.
+	if err := saveModel(bp, filepath.Join(modelDir, "gen_0.json")); err != nil {
+		log.Printf("Failed to save initial model: %v", err)
+	}
+
+	// Step 4: Create initial checkpoint.
 	fmt.Println("Step 4: Creating initial checkpoint with all training data...")
 	checkpoints := bp.CheckpointAllHiddenNeurons(getInputs(trainSamples), 1)
 	fmt.Printf("Checkpoint created with %d samples\n", len(checkpoints))
 
-	// Set up multi-threading to use 80% of CPU cores.
-	numCPUs := int(float64(runtime.NumCPU()) * 0.8)
-	runtime.GOMAXPROCS(numCPUs)
-	fmt.Printf("Using %d CPU cores (80%% of %d)\n", numCPUs, runtime.NumCPU())
+	// Calculate number of workers (80% of CPU cores).
+	numCPUs := runtime.NumCPU()
+	numWorkers := int(float64(numCPUs) * 0.8)
+	runtime.GOMAXPROCS(numWorkers)
+	fmt.Printf("Using %d workers (80%% of %d CPUs)\n", numWorkers, numCPUs)
 
-	// Generational loop
-	generation := 1
-	for generation <= 10 { // Terminate after 10 generations
-		fmt.Printf("\n=== Generation %d ===\n", generation)
+	// Generational loop (10 generations).
+	for generation := 1; generation <= 10; generation++ {
+		// Reset improvement flag.
+		improved = false
 
-		// Step 5: Create and evaluate 10 copies in parallel.
-		results := make(chan ModelResult, 10)
-		var wg sync.WaitGroup
-		for i := 0; i < 10; i++ {
-			wg.Add(1)
-			go func(copyID int) {
-				defer wg.Done()
-				result := evolveModel(bp, trainSamples, checkpoints, copyID)
-				results <- result
-			}(i)
+		// Record generation start time.
+		genStartTime := time.Now()
+		fmt.Printf("\n=== Generation %d started at %s ===\n", generation, genStartTime.Format("2006-01-02 15:04:05"))
+
+		// Set up worker pool.
+		jobChan := make(chan int, numModels)
+		resultChan := make(chan ModelResult, numModels)
+
+		// Start worker goroutines.
+		for i := 0; i < numWorkers; i++ {
+			go func() {
+				for job := range jobChan {
+					if improved {
+						return
+					}
+					result := evolveModel(bp, trainSamples, checkpoints, job)
+					resultChan <- result
+				}
+			}()
 		}
 
-		// Wait for all copies to finish and collect results.
-		go func() {
-			wg.Wait()
-			close(results)
-		}()
+		// Send jobs to workers.
+		for i := 0; i < numModels; i++ {
+			jobChan <- i
+		}
+		close(jobChan)
 
-		// Find the best model from the copies based on any metric improving.
-		bestExactAcc := currentExactAcc
-		bestClosenessBins := currentClosenessBins
-		bestApproxScore := currentApproxScore
-		var bestBP *phase.Phase
-		for result := range results {
-			fmt.Printf("Copy %d added %d neurons, ExactAcc=%.4f, ClosenessBins=%v, ApproxScore=%.4f\n",
-				result.BP.ID, result.NeuronsAdded, result.ExactAcc, formatClosenessBins(result.ClosenessBins), result.ApproxScore)
-			if isImproved(result.ExactAcc, result.ClosenessBins, result.ApproxScore, bestExactAcc, bestClosenessBins, bestApproxScore) {
-				bestExactAcc = result.ExactAcc
-				bestClosenessBins = result.ClosenessBins
-				bestApproxScore = result.ApproxScore
-				bestBP = result.BP
+		// Collect results from workers.
+		resultsCollected := 0
+		for resultsCollected < numModels {
+			result := <-resultChan
+			resultsCollected++
+			improvedMutex.Lock()
+			if result.ExactAcc > currentExactAcc+epsilon && !improved {
+				improved = true
+				bp = result.BP
+				currentExactAcc = result.ExactAcc
+				currentClosenessBins = result.ClosenessBins
+				currentApproxScore = result.ApproxScore
+				// Save the improved model.
+				modelPath := filepath.Join(modelDir, fmt.Sprintf("gen_%d.json", generation))
+				if err := saveModel(bp, modelPath); err != nil {
+					log.Printf("Failed to save model for generation %d: %v", generation, err)
+				}
+				improvedMutex.Unlock()
+				break // Stop collecting results and move to next generation.
 			}
+			improvedMutex.Unlock()
 		}
 
-		// Step 6: Update model if any metric improved.
-		if bestBP != nil {
-			fmt.Printf("Improved model found! New metrics: ExactAcc=%.4f, ClosenessBins=%v, ApproxScore=%.4f (old: %.4f, %v, %.4f)\n",
-				bestExactAcc, formatClosenessBins(bestClosenessBins), bestApproxScore, currentExactAcc, formatClosenessBins(currentClosenessBins), currentApproxScore)
-			bp = bestBP
-			currentExactAcc = bestExactAcc
-			currentClosenessBins = bestClosenessBins
-			currentApproxScore = bestApproxScore
-			// Recreate checkpoint with the new model, covering all training data.
+		// Update if a better model is found.
+		if improved {
+			fmt.Printf("Improved model found in generation %d!\n", generation)
+			fmt.Printf("Metric improvements:\n")
+			fmt.Printf("  ExactAcc: %.4f → %.4f\n", currentExactAcc-epsilon, currentExactAcc)
+			fmt.Printf("  ApproxScore: %.4f → %.4f\n", currentApproxScore, currentApproxScore)
+			fmt.Printf("  ClosenessBins: %v\n", formatClosenessBins(currentClosenessBins))
+			// Recreate checkpoints for the new model.
 			fmt.Println("Recreating checkpoint with updated model...")
 			checkpoints = bp.CheckpointAllHiddenNeurons(getInputs(trainSamples), 1)
 			fmt.Printf("New checkpoint created with %d samples\n", len(checkpoints))
 		} else {
-			fmt.Println("No significant improvement in any metric found in this generation.")
+			fmt.Println("No significant improvement in ExactAcc found in this generation.")
 		}
 
-		generation++
+		// Record generation end time and calculate duration.
+		genEndTime := time.Now()
+		genDuration := genEndTime.Sub(genStartTime).Seconds()
+		fmt.Printf("Generation %d finished at %s, duration: %.2f seconds\n", generation, genEndTime.Format("2006-01-02 15:04:05"), genDuration)
 	}
 
-	fmt.Println("\nDone. Training completed.")
+	// Record and display process end time and total time.
+	processEndTime := time.Now()
+	totalProcessTime := processEndTime.Sub(processStartTime).Seconds()
+	fmt.Printf("\nProcess finished at %s, total time: %.2f seconds\n", processEndTime.Format("2006-01-02 15:04:05"), totalProcessTime)
 }
 
-// evolveModel creates a copy of the model and attempts to improve it by adding neurons.
+// evolveModel creates a model copy and improves it by adding neurons.
 func evolveModel(originalBP *phase.Phase, samples []Sample, checkpoints []map[int]map[string]interface{}, copyID int) ModelResult {
-	// Copy the original model using the existing Copy method.
 	bp := originalBP.Copy()
-	bp.ID = copyID // Assign the copyID as the new ID
+	bp.ID = copyID
 
-	// Baseline metrics using checkpoint evaluation
 	bestExactAcc, bestClosenessBins, bestApproxScore := evaluateModelWithCheckpoints(bp, samples, checkpoints)
 	neuronsAdded := 0
-	maxAttempts := 5 // Number of attempts to add neurons
+	maxAttempts := 5
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		// Add 1-50 neurons randomly with 1-50 connections each
-		numToAdd := rand.Intn(50) + 1 // 1 to 50 neurons
+		improvedMutex.Lock()
+		if improved {
+			improvedMutex.Unlock()
+			return ModelResult{BP: bp, ExactAcc: bestExactAcc, ClosenessBins: bestClosenessBins, ApproxScore: bestApproxScore, NeuronsAdded: neuronsAdded}
+		}
+		improvedMutex.Unlock()
+
+		numToAdd := rand.Intn(50) + 1
 		for i := 0; i < numToAdd; i++ {
-			newN := bp.AddNeuronFromPreOutputs("dense", "", 1, 50) // Random activation, 1-50 connections
+			newN := bp.AddNeuronFromPreOutputs("dense", "", 1, 50)
 			if newN == nil {
 				continue
 			}
@@ -161,15 +211,12 @@ func evolveModel(originalBP *phase.Phase, samples []Sample, checkpoints []map[in
 			neuronsAdded++
 		}
 
-		// Evaluate the new model using checkpoint-based metrics
 		newExactAcc, newClosenessBins, newApproxScore := evaluateModelWithCheckpoints(bp, samples, checkpoints)
-		if isImproved(newExactAcc, newClosenessBins, newApproxScore, bestExactAcc, bestClosenessBins, bestApproxScore) {
+		if newExactAcc > bestExactAcc+epsilon {
 			bestExactAcc = newExactAcc
 			bestClosenessBins = newClosenessBins
 			bestApproxScore = newApproxScore
-			// Keep this configuration and continue adding
 		} else {
-			// Revert to the original copy and try again
 			bp = originalBP.Copy()
 			bp.ID = copyID
 			neuronsAdded = 0
@@ -185,9 +232,8 @@ func evolveModel(originalBP *phase.Phase, samples []Sample, checkpoints []map[in
 	}
 }
 
-// evaluateModelWithCheckpoints evaluates the model using checkpoints and returns exactAcc, closenessBins, and approxScore.
+// evaluateModelWithCheckpoints evaluates a model using checkpoints.
 func evaluateModelWithCheckpoints(bp *phase.Phase, samples []Sample, checkpoints ...[]map[int]map[string]interface{}) (float64, []float64, float64) {
-	// If checkpoints are provided, use them; otherwise, compute new ones
 	var chkpts []map[int]map[string]interface{}
 	if len(checkpoints) > 0 && len(checkpoints[0]) == len(samples) {
 		chkpts = checkpoints[0]
@@ -195,63 +241,16 @@ func evaluateModelWithCheckpoints(bp *phase.Phase, samples []Sample, checkpoints
 		chkpts = bp.CheckpointAllHiddenNeurons(getInputs(samples), 1)
 	}
 
-	// Convert labels to float64 for EvaluateMetricsFromCheckpoints
 	labels := make([]float64, len(samples))
 	for i, sample := range samples {
 		labels[i] = float64(sample.Label)
 	}
 
-	// Evaluate using the checkpoint-based method
 	exactAcc, closenessBins, approxScore := bp.EvaluateMetricsFromCheckpoints(chkpts, labels)
 	return exactAcc, closenessBins, approxScore
 }
 
-// isImproved checks if any metric (exactAcc, closenessBins, approxScore) has improved.
-func isImproved(newExactAcc float64, newClosenessBins []float64, newApproxScore float64, oldExactAcc float64, oldClosenessBins []float64, oldApproxScore float64) bool {
-	// Check ExactAcc improvement
-	if newExactAcc > oldExactAcc+epsilon {
-		return true
-	}
-
-	// Check ApproxScore improvement
-	if newApproxScore > oldApproxScore+epsilon {
-		return true
-	}
-
-	// Check ClosenessBins improvement (higher bins increase, e.g., shift from >90% to 80-90%)
-	newClosenessScore := weightedClosenessScore(newClosenessBins)
-	oldClosenessScore := weightedClosenessScore(oldClosenessBins)
-	if newClosenessScore > oldClosenessScore+epsilon {
-		return true
-	}
-
-	return false
-}
-
-// weightedClosenessScore computes a score for closenessBins, weighting higher bins (lower difference) more.
-func weightedClosenessScore(bins []float64) float64 {
-	score := 0.0
-	for i, bin := range bins {
-		weight := float64(10 - i) // 10 down to 1
-		score += bin * weight
-	}
-	return score / 100.0 // Normalize to [0, 100] range
-}
-
-// formatClosenessBins formats the closeness bins for readable output.
-func formatClosenessBins(bins []float64) string {
-	s := "["
-	for i, bin := range bins {
-		if i > 0 {
-			s += ", "
-		}
-		s += fmt.Sprintf("%.2f", bin)
-	}
-	s += "]"
-	return s
-}
-
-// getInputs extracts inputs from a slice of samples.
+// getInputs extracts inputs from samples.
 func getInputs(samples []Sample) []map[int]float64 {
 	inputs := make([]map[int]float64, len(samples))
 	for i, sample := range samples {
@@ -260,7 +259,34 @@ func getInputs(samples []Sample) []map[int]float64 {
 	return inputs
 }
 
-// Helper Functions (unchanged)
+// saveModel saves the model to a JSON file.
+func saveModel(bp *phase.Phase, filePath string) error {
+	data, err := json.Marshal(bp)
+	if err != nil {
+		return fmt.Errorf("failed to serialize model: %v", err)
+	}
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write model to file: %v", err)
+	}
+	fmt.Printf("Model saved to %s\n", filePath)
+	return nil
+}
+
+// loadModel loads a model from a JSON file.
+func loadModel(filePath string) (*phase.Phase, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read model file: %v", err)
+	}
+	bp := phase.NewPhase()
+	if err := json.Unmarshal(data, bp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal model: %v", err)
+	}
+	fmt.Printf("Model loaded from %s\n", filePath)
+	return bp, nil
+}
+
+// ensureMNISTDownloads downloads and unzips MNIST data if needed.
 func ensureMNISTDownloads(bp *phase.Phase, targetDir string) error {
 	if err := os.MkdirAll(targetDir, os.ModePerm); err != nil {
 		return err
@@ -285,6 +311,7 @@ func ensureMNISTDownloads(bp *phase.Phase, targetDir string) error {
 	return nil
 }
 
+// loadMNIST loads MNIST images and labels from files.
 func loadMNIST(dir, imageFile, labelFile string, limit int) ([]map[int]float64, []int, error) {
 	imgPath := filepath.Join(dir, imageFile)
 	fImg, err := os.Open(imgPath)
@@ -340,10 +367,15 @@ func loadMNIST(dir, imageFile, labelFile string, limit int) ([]map[int]float64, 
 	return inputs, labels, nil
 }
 
-func saveModelOrWarn(bp *phase.Phase, filePath string) {
-	if err := bp.SaveToJSON(filePath); err != nil {
-		fmt.Printf("Warning: failed to save model to %s => %v\n", filePath, err)
-	} else {
-		fmt.Printf("Model saved to %s\n", filePath)
+// formatClosenessBins formats the closeness bins for readable output.
+func formatClosenessBins(bins []float64) string {
+	s := "["
+	for i, bin := range bins {
+		if i > 0 {
+			s += ", "
+		}
+		s += fmt.Sprintf("%.2f", bin)
 	}
+	s += "]"
+	return s
 }
