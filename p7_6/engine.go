@@ -26,6 +26,7 @@ const (
 	initialNumModels       = 10  // Starting number of models per generation
 	maxNumModels           = 100 // Maximum number of models per generation
 	noImprovementThreshold = 5   // Generations without improvement before increasing models
+	maxIterations          = 25
 )
 
 type Sample struct {
@@ -241,7 +242,6 @@ func evolveModel(originalBP *phase.Phase, samples []Sample, checkpoints []map[in
 	bestClosenessQuality := computeClosenessQuality(bestClosenessBins)
 	neuronsAdded := 0
 
-	maxIterations := 50
 	iterations := 0
 	consecutiveFailures := 0
 	maxConsecutiveFailures := 5
