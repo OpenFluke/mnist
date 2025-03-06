@@ -245,6 +245,7 @@ func generation() {
 		// Calculate full running time since process start
 		fullRunningTime := time.Since(processStartTime)
 
+		currentGenNumber++
 		fmt.Printf("=== GEN %d finished. Gen time: %s, Full: %s, Avg: %s\n",
 			generation, genDuration, fullRunningTime, avgGenTime)
 	}
