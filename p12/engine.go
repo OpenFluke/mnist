@@ -271,7 +271,7 @@ func training() bool {
 		wg.Wait()
 	} else {
 		for i := 0; i < currentNumModels; i++ {
-			result := baseBP.Grow(evalWithMultiCore, checkpointFolder, baseBP, &trainSamples, &initialCheckpoint, i, maxIterations, maxConsecutiveFailures, minConnections, maxConnections, epsilon)
+			result := baseBP.Grow(minNeuronsToAdd, maxNeuronsToAdd, evalWithMultiCore, checkpointFolder, baseBP, &trainSamples, &initialCheckpoint, i, maxIterations, maxConsecutiveFailures, minConnections, maxConnections, epsilon)
 			results[i] = result
 		}
 	}
