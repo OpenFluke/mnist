@@ -5,19 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	"phase" // Replace with your actual import path, e.g., "github.com/yourusername/phase"
 )
-
-type Sample struct {
-	Inputs map[int]float64
-	Label  int
-}
 
 const (
 	baseURL           = "https://storage.googleapis.com/cvdf-datasets/mnist/"
@@ -27,26 +25,37 @@ const (
 	modelDir          = "models"
 	currentNumModels  = 10
 	useMultithreading = false
+	epsilon           = 0.001
+	numTournaments    = 5
 )
 
 var (
-	numCPUs           int
-	numWorkers        int
-	initialCheckpoint []map[int]map[string]interface{}
-	trainSize         int
-	testSize          int
-	trainSamples      []Sample
-	testSamples       []Sample
-	trainInputs       []map[int]float64
-	trainLabels       []int
-	processStartTime  time.Time
-	avgGenTime        time.Duration
-	startGeneration   = 1
-	maxGenerations    = 500
-	layers            = []int{784, 64, 10}
-	hiddenAct         = "relu"
-	outputAct         = "linear"
-	selectedModel     *phase.Phase
+	numCPUs                 int
+	numWorkers              int
+	initialCheckpoint       []map[int]map[string]interface{}
+	trainSize               int
+	testSize                int
+	trainSamples            []phase.Sample
+	testSamples             []phase.Sample
+	trainInputs             []map[int]float64
+	trainLabels             []int
+	processStartTime        time.Time
+	avgGenTime              time.Duration
+	startGeneration         = 1
+	maxGenerations          = 500
+	currentGenNumber        = 1
+	layers                  = []int{784, 64, 10}
+	hiddenAct               = "relu"
+	outputAct               = "linear"
+	selectedModel           *phase.Phase
+	maxIterations           = 10
+	maxConsecutiveFailures  = 5
+	minConnections          = 1
+	maxConnections          = 50
+	currentExactAcc         float64
+	currentClosenessBins    []float64
+	currentApproxScore      float64
+	currentClosenessQuality float64
 )
 
 func main() {
@@ -54,7 +63,7 @@ func main() {
 	processStartTime = time.Now()
 	fmt.Printf("Process started at %s\n", processStartTime.Format("2006-01-02 15:04:05"))
 	setupMnist()
-	initModel()
+	selectedModel = initModel() // Assign the returned model
 	generation()
 }
 
@@ -87,37 +96,143 @@ func setupMnist() {
 	testSize = len(trainInputs) - trainSize
 
 	// Initialize trainSamples and testSamples slices
-	trainSamples = make([]Sample, trainSize)
-	testSamples = make([]Sample, testSize)
+	trainSamples = make([]phase.Sample, trainSize)
+	testSamples = make([]phase.Sample, testSize)
 
 	// Populate trainSamples (first 80%)
 	for i := 0; i < trainSize; i++ {
-		trainSamples[i] = Sample{Inputs: trainInputs[i], Label: trainLabels[i]}
+		trainSamples[i] = phase.Sample{Inputs: trainInputs[i], Label: trainLabels[i]}
 	}
 
 	// Populate testSamples (remaining 20%)
 	for i := 0; i < testSize; i++ {
-		testSamples[i] = Sample{Inputs: trainInputs[trainSize+i], Label: trainLabels[trainSize+i]}
+		testSamples[i] = phase.Sample{Inputs: trainInputs[trainSize+i], Label: trainLabels[trainSize+i]}
 	}
 
 	fmt.Printf("Using %d samples for training and %d samples for testing\n", len(trainSamples), len(testSamples))
 }
 
-func initModel() {
-	//will extend this to load/save/pick best init model i suppose later
-	selectedModel = phase.NewPhaseWithLayers(layers, hiddenAct, outputAct)
+func initModel() *phase.Phase {
+	// Check for the latest generation model in the models directory
+	files, err := os.ReadDir(modelDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// If the directory doesn’t exist, create it and proceed with a new model
+			if err := os.MkdirAll(modelDir, 0755); err != nil {
+				log.Fatalf("Failed to create models directory: %v", err)
+			}
+		} else {
+			log.Fatalf("Failed to read models directory: %v", err)
+		}
+	}
+
+	latestGen := -1
+	var latestFile string
+	for _, file := range files {
+		if !file.IsDir() && strings.HasPrefix(file.Name(), "gen_") && strings.HasSuffix(file.Name(), ".json") {
+			genStr := strings.TrimPrefix(strings.TrimSuffix(file.Name(), ".json"), "gen_")
+			gen, err := strconv.Atoi(genStr)
+			if err == nil && gen > latestGen {
+				latestGen = gen
+				latestFile = file.Name()
+			}
+		}
+	}
+
+	// If a latest generation model exists, load it
+	if latestGen != -1 {
+		modelPath := filepath.Join(modelDir, latestFile)
+		fmt.Println("Saved model found. Loading it...")
+		data, err := os.ReadFile(modelPath)
+		if err != nil {
+			log.Fatalf("Failed to read saved model %s: %v", modelPath, err)
+		}
+		loadedBP := phase.NewPhase()
+		if err := json.Unmarshal(data, loadedBP); err != nil { // Use Unmarshal directly since POC used DeserializesFromJSON
+			log.Fatalf("Failed to deserialize model from %s: %v", modelPath, err)
+		}
+		fmt.Printf("Loaded model from %s (generation %d)\n", modelPath, latestGen)
+		return loadedBP
+	}
+
+	// Otherwise, create a new model
+	fmt.Println("No saved model found. Creating new neural network...")
+	return phase.NewPhaseWithLayers(layers, hiddenAct, outputAct)
+}
+
+func testModelPerformance(checkpoint []map[int]map[string]interface{}) {
+	if selectedModel == nil {
+		log.Fatalf("Cannot test model performance: selectedModel is nil")
+	}
+
+	// Test on training set (using provided checkpoint)
+	fmt.Println("Testing current model performance on training set...")
+	trainLabels := phase.GetLabels(&trainSamples)
+	trainExactAcc, trainClosenessBins, trainApproxScore := selectedModel.EvaluateWithCheckpoints(&checkpoint, trainLabels)
+	trainClosenessQuality := selectedModel.ComputeClosenessQuality(trainClosenessBins)
+
+	fmt.Printf("Training Set Metrics (Checkpoint size: %d, Labels size: %d):\n", len(checkpoint), len(*trainLabels))
+	fmt.Printf("  ExactAcc: %.4f%%\n", trainExactAcc)
+	fmt.Printf("  ClosenessBins: %v\n", phase.FormatClosenessBins(trainClosenessBins))
+	fmt.Printf("  ApproxScore: %.4f\n", trainApproxScore)
+	fmt.Printf("  ClosenessQuality: %.4f\n", trainClosenessQuality)
+
+	// Test on test set (create a new checkpoint for test samples)
+	fmt.Println("Creating checkpoint for test samples...")
+	testCheckpoint := selectedModel.CheckpointPreOutputNeurons(getInputs(testSamples), 1)
+	fmt.Printf("Test checkpoint created with %d samples\n", len(testCheckpoint))
+
+	fmt.Println("Testing current model performance on test set...")
+	testLabels := phase.GetLabels(&testSamples)
+	testExactAcc, testClosenessBins, testApproxScore := selectedModel.EvaluateWithCheckpoints(&testCheckpoint, testLabels)
+	testClosenessQuality := selectedModel.ComputeClosenessQuality(testClosenessBins)
+
+	fmt.Printf("Test Set Metrics (Checkpoint size: %d, Labels size: %d):\n", len(testCheckpoint), len(*testLabels))
+	fmt.Printf("  ExactAcc: %.4f%%\n", testExactAcc)
+	fmt.Printf("  ClosenessBins: %v\n", phase.FormatClosenessBins(testClosenessBins))
+	fmt.Printf("  ApproxScore: %.4f\n", testApproxScore)
+	fmt.Printf("  ClosenessQuality: %.4f\n", testClosenessQuality)
+}
+
+func createInitialCheckpoint() {
+	if selectedModel == nil {
+		log.Fatalf("Cannot create initial checkpoint: selectedModel is nil")
+	}
+	if len(trainSamples) == 0 {
+		log.Fatalf("Cannot create initial checkpoint: trainSamples is empty")
+	}
+	fmt.Println("Creating initial checkpoint for training samples...")
+	initialCheckpoint = selectedModel.CheckpointPreOutputNeurons(getInputs(trainSamples), 1)
+	fmt.Printf("Initial checkpoint created with %d samples\n", len(initialCheckpoint))
+}
+
+// Helper function (since it’s not in your code yet)
+func getInputs(samples []phase.Sample) []map[int]float64 {
+	inputs := make([]map[int]float64, len(samples))
+	for i, sample := range samples {
+		inputs[i] = sample.Inputs
+	}
+	return inputs
 }
 
 func generation() {
 	var totalGenTime time.Duration // To accumulate total time across generations
 	genCount := 0                  // To count the number of generations
+	createInitialCheckpoint()
+
+	testModelPerformance(initialCheckpoint)
 
 	for generation := startGeneration; generation <= maxGenerations; generation++ {
 		genStartTime := time.Now()
 		fmt.Printf("\n=== GEN %d started %s\n", generation, genStartTime.Format("2006-01-02 15:04:05"))
 
 		// Simulate some work here (if any) - currently empty in your code
-		training()
+		improved := training() // Check if training improved the model
+
+		if improved {
+			fmt.Println("Regenerating checkpoint due to model improvement...")
+			createInitialCheckpoint() // Update checkpoint with the improved selectedModel
+		}
 
 		// Calculate generation duration and update total time
 		genDuration := time.Since(genStartTime)
@@ -135,42 +250,62 @@ func generation() {
 	}
 }
 
-func training() {
-	//var results []phase.ModelResult
+func training() bool {
+	results := make([]phase.ModelResult, 0, currentNumModels)
+	baseBP := selectedModel // Use the global initialized model
+
 	if useMultithreading {
-		/*jobChan := make(chan int, currentNumModels)
-		resultChan := make(chan phase.ModelResult, currentNumModels)
-
-		for i := 0; i < numWorkers; i++ {
-			go func(workerID int) {
-				for job := range jobChan {
-					resultChan <- evolveModel(bp, trainSamples, checkpoints, job, generation, workerID)
-				}
-			}(i)
-		}
-
-		for i := 0; i < currentNumModels; i++ {
-			jobChan <- i
-		}
-		close(jobChan)
-
-		for i := 0; i < currentNumModels; i++ {
-			results = append(results, <-resultChan)
-		}*/
+		fmt.Println("Multithreading not implemented yet")
 	} else {
 		for i := 0; i < currentNumModels; i++ {
-			//results = append(results, evolveModel(bp, trainSamples, checkpoints, i, generation, 0))
+			result := baseBP.Grow(baseBP, &trainSamples, &initialCheckpoint, i, maxIterations, maxConsecutiveFailures, minConnections, maxConnections, epsilon)
+			results = append(results, result)
 		}
 	}
-}
 
-func grow(originalBP *phase.Phase, samples *[]Sample, workerID int) ModelResult {
-	bestBP := originalBP.Copy()
+	// Initialize metrics if not set (first generation)
+	if currentExactAcc == 0 && len(currentClosenessBins) == 0 && currentApproxScore == 0 {
+		labels := phase.GetLabels(&trainSamples)
+		currentExactAcc, currentClosenessBins, currentApproxScore = baseBP.EvaluateWithCheckpoints(&initialCheckpoint, labels)
+		currentClosenessQuality = baseBP.ComputeClosenessQuality(currentClosenessBins)
+	}
 
-	var bestExactAcc float64
-	var bestClosenessBins []float64
-	var bestApproxScore float64
+	var bestSelected phase.ModelResult
+	bestImprovement := -math.MaxFloat64
+	for i := 0; i < numTournaments; i++ {
+		candidate := baseBP.TournamentSelection(results, currentExactAcc, currentClosenessQuality, currentApproxScore, 3)
+		candidateImprovement := baseBP.ComputeTotalImprovement(candidate, currentExactAcc, currentClosenessQuality, currentApproxScore)
+		if candidateImprovement > bestImprovement {
+			bestImprovement = candidateImprovement
+			bestSelected = candidate
+		}
+	}
 
+	if bestImprovement > 0 {
+		newClosenessQuality := baseBP.ComputeClosenessQuality(bestSelected.ClosenessBins)
+		deltaExactAcc := bestSelected.ExactAcc - currentExactAcc
+		deltaApproxScore := bestSelected.ApproxScore - currentApproxScore
+		deltaClosenessQuality := newClosenessQuality - currentClosenessQuality
+
+		fmt.Printf("Improved model found in generation %d with total improvement %.4f via tournament selection\n", generation, bestImprovement)
+		fmt.Printf("Metric improvements:\n")
+		fmt.Printf("  ExactAcc: %.4f → %.4f (Δ %.4f)\n", currentExactAcc, bestSelected.ExactAcc, deltaExactAcc)
+		fmt.Printf("  ClosenessBins: %v → %v\n", phase.FormatClosenessBins(currentClosenessBins), phase.FormatClosenessBins(bestSelected.ClosenessBins))
+		fmt.Printf("  ClosenessQuality: %.4f → %.4f (Δ %.4f)\n", currentClosenessQuality, newClosenessQuality, deltaClosenessQuality)
+		fmt.Printf("  ApproxScore: %.4f → %.4f (Δ %.4f)\n", currentApproxScore, bestSelected.ApproxScore, deltaApproxScore)
+
+		selectedModel = bestSelected.BP
+		currentExactAcc = bestSelected.ExactAcc
+		currentClosenessBins = bestSelected.ClosenessBins
+		currentApproxScore = bestSelected.ApproxScore
+
+		modelPath := filepath.Join(modelDir, fmt.Sprintf("gen_%d.json", currentGenNumber))
+		if err := selectedModel.SaveToJSON(modelPath); err != nil {
+			log.Printf("Failed to save model for generation %d: %v", generation, err)
+		}
+		return true // Indicate improvement
+	}
+	return false // No improvement
 }
 
 func OLD() {
