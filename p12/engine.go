@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"phase" // Replace with your actual import path, e.g., "github.com/yourusername/phase"
@@ -25,9 +26,10 @@ const (
 	modelDir          = "models"
 	checkpointFolder  = "checkpoints"
 	currentNumModels  = 10
-	useMultithreading = false
+	useMultithreading = true
 	epsilon           = 0.001
 	numTournaments    = 5
+	evalWithMultiCore = false
 )
 
 var (
@@ -49,7 +51,7 @@ var (
 	hiddenAct               = "relu"
 	outputAct               = "linear"
 	selectedModel           *phase.Phase
-	maxIterations           = 10
+	maxIterations           = 5
 	maxConsecutiveFailures  = 5
 	minConnections          = 1
 	maxConnections          = 50
@@ -169,7 +171,9 @@ func testModelPerformance(checkpoint []map[int]map[string]interface{}) {
 	// Test on training set (using provided checkpoint)
 	fmt.Println("Testing current model performance on training set...")
 	trainLabels := phase.GetLabels(&trainSamples)
+
 	trainExactAcc, trainClosenessBins, trainApproxScore := selectedModel.EvaluateWithCheckpoints(checkpointFolder, &checkpoint, trainLabels)
+
 	trainClosenessQuality := selectedModel.ComputeClosenessQuality(trainClosenessBins)
 
 	fmt.Printf("Training Set Metrics (Checkpoint size: %d, Labels size: %d):\n", len(checkpoint), len(*trainLabels))
@@ -187,7 +191,13 @@ func createInitialCheckpoint() {
 		log.Fatalf("Cannot create initial checkpoint: trainSamples is empty")
 	}
 	fmt.Println("Creating initial checkpoint for training samples...")
-	initialCheckpoint = selectedModel.CheckpointPreOutputNeurons(checkpointFolder, getInputs(trainSamples), 1)
+
+	if evalWithMultiCore {
+		initialCheckpoint = selectedModel.CheckpointPreOutputNeuronsMultiCore(checkpointFolder, getInputs(trainSamples), 1)
+	} else {
+		initialCheckpoint = selectedModel.CheckpointPreOutputNeurons(checkpointFolder, getInputs(trainSamples), 1)
+	}
+
 	fmt.Printf("Initial checkpoint created with %d samples\n", len(initialCheckpoint))
 }
 
@@ -241,10 +251,25 @@ func training() bool {
 	baseBP := selectedModel // Use the global initialized model
 
 	if useMultithreading {
-		fmt.Println("Multithreading not implemented yet")
+		numWorkers := int(float64(runtime.NumCPU()) * 0.8) // 80% of CPU cores
+		var wg sync.WaitGroup
+		semaphore := make(chan struct{}, numWorkers) // Limit to 80% of CPUs
+
+		for i := 0; i < currentNumModels; i++ {
+			wg.Add(1)
+			semaphore <- struct{}{} // Acquire semaphore slot
+			go func(workerID int) {
+				defer wg.Done()
+				defer func() { <-semaphore }() // Release semaphore slot
+				result := baseBP.Grow(evalWithMultiCore, checkpointFolder, baseBP, &trainSamples, &initialCheckpoint, workerID, maxIterations, maxConsecutiveFailures, minConnections, maxConnections, epsilon)
+				results[workerID] = result
+			}(i)
+		}
+
+		wg.Wait()
 	} else {
 		for i := 0; i < currentNumModels; i++ {
-			result := baseBP.Grow(checkpointFolder, baseBP, &trainSamples, &initialCheckpoint, i, maxIterations, maxConsecutiveFailures, minConnections, maxConnections, epsilon)
+			result := baseBP.Grow(evalWithMultiCore, checkpointFolder, baseBP, &trainSamples, &initialCheckpoint, i, maxIterations, maxConsecutiveFailures, minConnections, maxConnections, epsilon)
 			results = append(results, result)
 		}
 	}
