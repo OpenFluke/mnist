@@ -53,12 +53,14 @@ var (
 	selectedModel           *phase.Phase
 	maxIterations           = 5
 	maxConsecutiveFailures  = 5
-	minConnections          = 1
-	maxConnections          = 50
+	minConnections          = 10
+	maxConnections          = 200
 	currentExactAcc         float64
 	currentClosenessBins    []float64
 	currentApproxScore      float64
 	currentClosenessQuality float64
+	minNeuronsToAdd         = 5
+	maxNeuronsToAdd         = 100
 )
 
 func main() {
@@ -261,7 +263,7 @@ func training() bool {
 			go func(workerID int) {
 				defer wg.Done()
 				defer func() { <-semaphore }() // Release semaphore slot
-				result := baseBP.Grow(evalWithMultiCore, checkpointFolder, baseBP, &trainSamples, &initialCheckpoint, workerID, maxIterations, maxConsecutiveFailures, minConnections, maxConnections, epsilon)
+				result := baseBP.Grow(minNeuronsToAdd, maxNeuronsToAdd, evalWithMultiCore, checkpointFolder, baseBP, &trainSamples, &initialCheckpoint, workerID, maxIterations, maxConsecutiveFailures, minConnections, maxConnections, epsilon)
 				results[workerID] = result
 			}(i)
 		}
