@@ -247,13 +247,13 @@ func generation() {
 }
 
 func training() bool {
-	results := make([]phase.ModelResult, 0, currentNumModels)
-	baseBP := selectedModel // Use the global initialized model
+	results := make([]phase.ModelResult, currentNumModels) // Pre-allocate with exact size
+	baseBP := selectedModel                                // Use the global initialized model
 
 	if useMultithreading {
 		numWorkers := int(float64(runtime.NumCPU()) * 0.8) // 80% of CPU cores
 		var wg sync.WaitGroup
-		semaphore := make(chan struct{}, numWorkers) // Limit to 80% of CPUs
+		semaphore := make(chan struct{}, numWorkers) // Limit concurrency to 80% of CPUs
 
 		for i := 0; i < currentNumModels; i++ {
 			wg.Add(1)
@@ -270,7 +270,7 @@ func training() bool {
 	} else {
 		for i := 0; i < currentNumModels; i++ {
 			result := baseBP.Grow(evalWithMultiCore, checkpointFolder, baseBP, &trainSamples, &initialCheckpoint, i, maxIterations, maxConsecutiveFailures, minConnections, maxConnections, epsilon)
-			results = append(results, result)
+			results[i] = result
 		}
 	}
 
