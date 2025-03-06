@@ -3,3 +3,4 @@ mnist_data
 models
 generations
 cpcache
+checkpoints

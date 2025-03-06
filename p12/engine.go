@@ -23,6 +23,7 @@ const (
 	modelFile         = "saved_model.json"
 	checkpointFile    = "saved_checkpoint.json"
 	modelDir          = "models"
+	checkpointFolder  = "checkpoints"
 	currentNumModels  = 10
 	useMultithreading = false
 	epsilon           = 0.001
@@ -168,7 +169,7 @@ func testModelPerformance(checkpoint []map[int]map[string]interface{}) {
 	// Test on training set (using provided checkpoint)
 	fmt.Println("Testing current model performance on training set...")
 	trainLabels := phase.GetLabels(&trainSamples)
-	trainExactAcc, trainClosenessBins, trainApproxScore := selectedModel.EvaluateWithCheckpoints(&checkpoint, trainLabels)
+	trainExactAcc, trainClosenessBins, trainApproxScore := selectedModel.EvaluateWithCheckpoints(checkpointFolder, &checkpoint, trainLabels)
 	trainClosenessQuality := selectedModel.ComputeClosenessQuality(trainClosenessBins)
 
 	fmt.Printf("Training Set Metrics (Checkpoint size: %d, Labels size: %d):\n", len(checkpoint), len(*trainLabels))
@@ -176,22 +177,6 @@ func testModelPerformance(checkpoint []map[int]map[string]interface{}) {
 	fmt.Printf("  ClosenessBins: %v\n", phase.FormatClosenessBins(trainClosenessBins))
 	fmt.Printf("  ApproxScore: %.4f\n", trainApproxScore)
 	fmt.Printf("  ClosenessQuality: %.4f\n", trainClosenessQuality)
-
-	// Test on test set (create a new checkpoint for test samples)
-	fmt.Println("Creating checkpoint for test samples...")
-	testCheckpoint := selectedModel.CheckpointPreOutputNeurons(getInputs(testSamples), 1)
-	fmt.Printf("Test checkpoint created with %d samples\n", len(testCheckpoint))
-
-	fmt.Println("Testing current model performance on test set...")
-	testLabels := phase.GetLabels(&testSamples)
-	testExactAcc, testClosenessBins, testApproxScore := selectedModel.EvaluateWithCheckpoints(&testCheckpoint, testLabels)
-	testClosenessQuality := selectedModel.ComputeClosenessQuality(testClosenessBins)
-
-	fmt.Printf("Test Set Metrics (Checkpoint size: %d, Labels size: %d):\n", len(testCheckpoint), len(*testLabels))
-	fmt.Printf("  ExactAcc: %.4f%%\n", testExactAcc)
-	fmt.Printf("  ClosenessBins: %v\n", phase.FormatClosenessBins(testClosenessBins))
-	fmt.Printf("  ApproxScore: %.4f\n", testApproxScore)
-	fmt.Printf("  ClosenessQuality: %.4f\n", testClosenessQuality)
 }
 
 func createInitialCheckpoint() {
@@ -202,7 +187,7 @@ func createInitialCheckpoint() {
 		log.Fatalf("Cannot create initial checkpoint: trainSamples is empty")
 	}
 	fmt.Println("Creating initial checkpoint for training samples...")
-	initialCheckpoint = selectedModel.CheckpointPreOutputNeurons(getInputs(trainSamples), 1)
+	initialCheckpoint = selectedModel.CheckpointPreOutputNeurons(checkpointFolder, getInputs(trainSamples), 1)
 	fmt.Printf("Initial checkpoint created with %d samples\n", len(initialCheckpoint))
 }
 
@@ -259,7 +244,7 @@ func training() bool {
 		fmt.Println("Multithreading not implemented yet")
 	} else {
 		for i := 0; i < currentNumModels; i++ {
-			result := baseBP.Grow(baseBP, &trainSamples, &initialCheckpoint, i, maxIterations, maxConsecutiveFailures, minConnections, maxConnections, epsilon)
+			result := baseBP.Grow(checkpointFolder, baseBP, &trainSamples, &initialCheckpoint, i, maxIterations, maxConsecutiveFailures, minConnections, maxConnections, epsilon)
 			results = append(results, result)
 		}
 	}
@@ -267,7 +252,7 @@ func training() bool {
 	// Initialize metrics if not set (first generation)
 	if currentExactAcc == 0 && len(currentClosenessBins) == 0 && currentApproxScore == 0 {
 		labels := phase.GetLabels(&trainSamples)
-		currentExactAcc, currentClosenessBins, currentApproxScore = baseBP.EvaluateWithCheckpoints(&initialCheckpoint, labels)
+		currentExactAcc, currentClosenessBins, currentApproxScore = baseBP.EvaluateWithCheckpoints(checkpointFolder, &initialCheckpoint, labels)
 		currentClosenessQuality = baseBP.ComputeClosenessQuality(currentClosenessBins)
 	}
 
@@ -307,157 +292,6 @@ func training() bool {
 		return true // Indicate improvement
 	}
 	return false // No improvement
-}
-
-func OLD() {
-	// Seed random number generator.
-	rand.Seed(time.Now().UnixNano())
-
-	// Step 1: Ensure MNIST is downloaded.
-	fmt.Println("Step 1: Ensuring MNIST dataset is downloaded...")
-	bp := phase.NewPhase()
-	if err := ensureMNISTDownloads(bp, mnistDir); err != nil {
-		log.Fatalf("Failed to ensure MNIST data: %v", err)
-	}
-
-	// Step 2: Load MNIST training data.
-	fmt.Println("Step 2: Loading MNIST training dataset...")
-	trainInputs, trainLabels, err := loadMNIST(mnistDir, "train-images-idx3-ubyte", "train-labels-idx1-ubyte", 60000)
-	if err != nil {
-		log.Fatalf("Error loading training MNIST: %v", err)
-	}
-	fmt.Printf("Loaded %d training samples\n", len(trainInputs))
-
-	// Step 3: Always use the first five samples.
-	fmt.Println("Step 3: Selecting the first five samples...")
-	fiveInputs := trainInputs[:5]
-	fiveLabels := trainLabels[:5]
-
-	// Check if saved model and checkpoint exist.
-	if fileExists(modelFile) && fileExists(checkpointFile) {
-		fmt.Println("Saved model and checkpoint found. Loading them...")
-		// Load the model.
-		data, err := os.ReadFile(modelFile)
-		if err != nil {
-			log.Fatalf("Failed to read saved model: %v", err)
-		}
-		loadedBP := phase.NewPhase()
-		if err := loadedBP.DeserializesFromJSON(string(data)); err != nil {
-			log.Fatalf("Failed to deserialize model: %v", err)
-		}
-		// Load the checkpoint.
-		chkData, err := os.ReadFile(checkpointFile)
-		if err != nil {
-			log.Fatalf("Failed to read saved checkpoint: %v", err)
-		}
-		var loadedCheckpoint []map[int]map[string]interface{}
-		if err := json.Unmarshal(chkData, &loadedCheckpoint); err != nil {
-			log.Fatalf("Failed to unmarshal checkpoint: %v", err)
-		}
-		// Run a cycle with the loaded model.
-		runCycle("Cycle 4: Loaded Model", loadedBP, fiveInputs, fiveLabels, loadedCheckpoint)
-	} else {
-		// Otherwise, run the experiment normally.
-
-		// Create the neural network.
-		fmt.Println("Creating the neural network...")
-		// For example: 784 inputs, 64 hidden neurons, and 10 output neurons.
-		bp = phase.NewPhaseWithLayers([]int{784, 64, 10}, "relu", "linear")
-
-		// Compute the initial checkpoint (pre-output state) only once.
-		fmt.Println("Computing initial checkpoint (pre-output states) for the first five samples...")
-		initialCheckpoint := bp.CheckpointPreOutputNeurons(fiveInputs, 1)
-
-		// Cycle 1: Initial state.
-		runCycle("Cycle 1: Initial State", bp, fiveInputs, fiveLabels, initialCheckpoint)
-
-		// Cycle 2: Add three neurons and then run both passes.
-		fmt.Println("Adding first batch of three neurons...")
-		for i := 0; i < 3; i++ {
-			newNeuron := bp.AddNeuronFromPreOutputs("dense", "relu", 1, 5)
-			if newNeuron == nil {
-				log.Fatal("Failed to add new neuron!")
-			}
-			fmt.Printf("Added new neuron with ID %d\n", newNeuron.ID)
-		}
-		runCycle("Cycle 2: After First Batch", bp, fiveInputs, fiveLabels, initialCheckpoint)
-
-		// Cycle 3: Add another three neurons and then run both passes.
-		fmt.Println("Adding second batch of three neurons...")
-		for i := 0; i < 3; i++ {
-			newNeuron := bp.AddNeuronFromPreOutputs("dense", "relu", 1, 5)
-			if newNeuron == nil {
-				log.Fatal("Failed to add new neuron!")
-			}
-			fmt.Printf("Added new neuron with ID %d\n", newNeuron.ID)
-		}
-		runCycle("Cycle 3: After Second Batch", bp, fiveInputs, fiveLabels, initialCheckpoint)
-
-		// --- Save model and checkpoint to disk.
-		fmt.Println("Saving model and checkpoint to disk...")
-		if err := bp.SaveToJSON(modelFile); err != nil {
-			log.Fatalf("Failed to save model: %v", err)
-		}
-		chkData, err := json.MarshalIndent(initialCheckpoint, "", "  ")
-		if err != nil {
-			log.Fatalf("Failed to marshal checkpoint: %v", err)
-		}
-		if err := os.WriteFile(checkpointFile, chkData, 0644); err != nil {
-			log.Fatalf("Failed to save checkpoint: %v", err)
-		}
-		fmt.Println("Model and checkpoint saved successfully.")
-
-		// Optionally, run one more cycle with the saved state.
-		runCycle("Cycle 4: Reloaded Model", bp, fiveInputs, fiveLabels, initialCheckpoint)
-	}
-
-	fmt.Println("Experiment complete.")
-}
-
-// runCycle runs a full forward pass (computing all neurons) and a partial forward pass
-// that uses the saved checkpoint for the old neurons and computes only new neurons' outputs.
-// It then prints the outputs and timing.
-func runCycle(cycleLabel string, bp *phase.Phase, inputs []map[int]float64, labels []int, checkpoint []map[int]map[string]interface{}) {
-	fmt.Println("\n==============================")
-	fmt.Println(cycleLabel)
-	fmt.Println("==============================")
-
-	// Full Forward Pass.
-	fmt.Println("\n--- Full Forward Pass Outputs ---")
-	startFull := time.Now()
-	for i, in := range inputs {
-		bp.ResetNeuronValues()
-		bp.Forward(in, 1)
-		outputs := bp.GetOutputs()
-		fmt.Printf("Sample %d (label %d): ", i+1, labels[i])
-		for _, outID := range bp.OutputNodes {
-			fmt.Printf("%.4f ", outputs[outID])
-		}
-		fmt.Println()
-	}
-	fmt.Printf("Full Forward Pass Time: %v\n", time.Since(startFull))
-
-	// Partial Forward Pass using the saved checkpoint.
-	fmt.Println("\n--- Partial Forward Pass Outputs (using checkpoint) ---")
-	startPartial := time.Now()
-	for i, ck := range checkpoint {
-		// ComputePartialOutputsFromCheckpoint should restore checkpointed state,
-		// process only new neurons, and update the output neurons.
-		outputs := bp.ComputePartialOutputsFromCheckpoint(ck)
-		fmt.Printf("Sample %d (label %d): ", i+1, labels[i])
-		for _, outID := range bp.OutputNodes {
-			fmt.Printf("%.4f ", outputs[outID])
-		}
-		fmt.Println()
-	}
-	fmt.Printf("Partial Forward Pass Time: %v\n", time.Since(startPartial))
-	time.Sleep(2 * time.Second)
-}
-
-// fileExists checks whether a file exists.
-func fileExists(filename string) bool {
-	info, err := os.Stat(filename)
-	return err == nil && !info.IsDir()
 }
 
 // --- Helper Functions for Data Loading and Downloads ---
