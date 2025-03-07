@@ -300,7 +300,7 @@ func training() bool {
 		deltaApproxScore := bestSelected.ApproxScore - currentApproxScore
 		deltaClosenessQuality := newClosenessQuality - currentClosenessQuality
 
-		fmt.Printf("Improved model found in generation %d with total improvement %.4f via tournament selection\n", currentGenNumber, bestImprovement)
+		fmt.Printf("Improved model found in generation %d with total improvement %.4f \n", currentGenNumber, bestImprovement)
 		fmt.Printf("Metric improvements:\n")
 		fmt.Printf("  ExactAcc: %.4f → %.4f (Δ %.4f)\n", currentExactAcc, bestSelected.ExactAcc, deltaExactAcc)
 		fmt.Printf("  ClosenessBins: %v → %v\n", "\n"+phase.FormatClosenessBins(currentClosenessBins)+"\n", phase.FormatClosenessBins(bestSelected.ClosenessBins))
