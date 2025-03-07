@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -283,7 +282,7 @@ func training() bool {
 		currentClosenessQuality = baseBP.ComputeClosenessQuality(currentClosenessBins)
 	}
 
-	var bestSelected phase.ModelResult
+	/*var bestSelected phase.ModelResult
 	bestImprovement := -math.MaxFloat64
 	for i := 0; i < numTournaments; i++ {
 		candidate := baseBP.TournamentSelection(results, currentExactAcc, currentClosenessQuality, currentApproxScore, 3)
@@ -292,7 +291,8 @@ func training() bool {
 			bestImprovement = candidateImprovement
 			bestSelected = candidate
 		}
-	}
+	}*/
+	bestSelected, bestImprovement := baseBP.SelectBestModel(results, currentExactAcc, currentClosenessQuality, currentApproxScore)
 
 	if bestImprovement > 0 {
 		newClosenessQuality := baseBP.ComputeClosenessQuality(bestSelected.ClosenessBins)
