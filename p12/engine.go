@@ -24,7 +24,7 @@ const (
 	modelFile         = "saved_model.json"
 	checkpointFile    = "saved_checkpoint.json"
 	modelDir          = "models"
-	checkpointFolder  = "checkpoints"
+	checkpointFolder  = ""
 	currentNumModels  = 10
 	useMultithreading = true
 	epsilon           = 0.001
@@ -51,16 +51,16 @@ var (
 	hiddenAct               = "relu"
 	outputAct               = "linear"
 	selectedModel           *phase.Phase
-	maxIterations           = 5
+	maxIterations           = 10
 	maxConsecutiveFailures  = 5
 	minConnections          = 10
-	maxConnections          = 200
+	maxConnections          = 100
 	currentExactAcc         float64
 	currentClosenessBins    []float64
 	currentApproxScore      float64
 	currentClosenessQuality float64
-	minNeuronsToAdd         = 5
-	maxNeuronsToAdd         = 100
+	minNeuronsToAdd         = 1
+	maxNeuronsToAdd         = 1
 )
 
 func main() {
