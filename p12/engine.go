@@ -25,9 +25,9 @@ const (
 	checkpointFile    = "saved_checkpoint.json"
 	modelDir          = "models"
 	checkpointFolder  = ""
-	currentNumModels  = 10
+	currentNumModels  = 30
 	useMultithreading = true
-	epsilon           = 0.001
+	epsilon           = 0.00
 	numTournaments    = 5
 	evalWithMultiCore = false
 )
@@ -47,14 +47,14 @@ var (
 	startGeneration         = 1
 	maxGenerations          = 500
 	currentGenNumber        = 1
-	layers                  = []int{784, 64, 10}
+	layers                  = []int{784, 1, 10}
 	hiddenAct               = "relu"
 	outputAct               = "linear"
 	selectedModel           *phase.Phase
 	maxIterations           = 10
 	maxConsecutiveFailures  = 5
 	minConnections          = 10
-	maxConnections          = 100
+	maxConnections          = 600
 	currentExactAcc         float64
 	currentClosenessBins    []float64
 	currentApproxScore      float64
