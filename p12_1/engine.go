@@ -388,23 +388,25 @@ func training() bool {
 		deltaApproxScore := bestSelected.ApproxScore - currentApproxScore
 		deltaClosenessQuality := newClosenessQuality - currentClosenessQuality
 
-		fmt.Printf("Improved model found in generation %d with total improvement %.4f via tournament selection\n", generation, bestImprovement)
+		fmt.Printf("Improved model found in generation %d with total improvement %.4f via tournament selection\n", currentGenNumber, bestImprovement)
 		fmt.Printf("Metric improvements:\n")
 		fmt.Printf("  ExactAcc: %.4f → %.4f (Δ %.4f)\n", currentExactAcc, bestSelected.ExactAcc, deltaExactAcc)
-		fmt.Printf("  ClosenessBins: %v → %v\n", phase.FormatClosenessBins(currentClosenessBins), phase.FormatClosenessBins(bestSelected.ClosenessBins))
+		fmt.Printf("  ClosenessBins: %v → %v\n", "\n"+phase.FormatClosenessBins(currentClosenessBins)+"\n", phase.FormatClosenessBins(bestSelected.ClosenessBins))
 		fmt.Printf("  ClosenessQuality: %.4f → %.4f (Δ %.4f)\n", currentClosenessQuality, newClosenessQuality, deltaClosenessQuality)
 		fmt.Printf("  ApproxScore: %.4f → %.4f (Δ %.4f)\n", currentApproxScore, bestSelected.ApproxScore, deltaApproxScore)
 
+		// Update globals
 		selectedModel = bestSelected.BP
 		currentExactAcc = bestSelected.ExactAcc
 		currentClosenessBins = bestSelected.ClosenessBins
 		currentApproxScore = bestSelected.ApproxScore
+		currentClosenessQuality = newClosenessQuality // Explicitly update this
 
 		modelPath := filepath.Join(modelDir, fmt.Sprintf("gen_%d.json", currentGenNumber))
 		if err := selectedModel.SaveToJSON(modelPath); err != nil {
-			log.Printf("Failed to save model for generation %d: %v", generation, err)
+			log.Printf("Failed to save model for generation %d: %v", currentGenNumber, err)
 		}
-		return true // Indicate improvement
+		return true
 	}
 	return false // No improvement
 }
