@@ -218,6 +218,12 @@ func createInitialCheckpoint() {
 	}
 
 	fmt.Printf("Initial checkpoint created with %d samples\n", len(initialCheckpoint))
+
+	// Export evaluation to CSV after improvement
+	csvFilePath := filepath.Join(modelDir, fmt.Sprintf("gen_%d_evaluation.csv", generation))
+	if err := selectedModel.EvaluateAndExportToCSV(&trainSamples, csvFilePath, 1); err != nil {
+		log.Printf("Failed to export evaluation to CSV for generation %d: %v", generation, err)
+	}
 }
 
 // Helper function (since it’s not in your code yet)
@@ -246,6 +252,7 @@ func generation() {
 		if improved {
 			fmt.Println("Regenerating checkpoint due to model improvement...")
 			createInitialCheckpoint() // Update checkpoint with the improved selectedModel
+
 		}
 
 		// Calculate generation duration and update total time
