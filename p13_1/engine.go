@@ -52,13 +52,14 @@ func main() {
 	plateauLimit := 3
 	plateauCount := 0
 	hasAddedNeurons := false
-	targetLayerForNeurons := 1 // Start with Hidden1
+	targetLayerForNeurons := 1
 	totalEpochs := 0
-	maxTotalEpochs := 200 // Prevent infinite loop
+	maxTotalEpochs := 200
 
 	// Training loop with dynamic growth
 	for totalEpochs < maxTotalEpochs {
 		prevLoss := math.Inf(1)
+		phaseEpochs := 0
 		for epoch := 0; epoch < epochsPerPhase && totalEpochs < maxTotalEpochs; epoch++ {
 			totalLoss := 0.0
 			perm := rand.Perm(len(inputs))
@@ -72,14 +73,14 @@ func main() {
 				nn.Forward(shuffledInputs[b])
 				loss := nn.ComputeLoss(shuffledTargets[b])
 				if math.IsNaN(loss) {
-					fmt.Printf("NaN loss detected at sample %d, epoch %d\n", b, totalEpochs+epoch)
+					fmt.Printf("NaN loss detected at sample %d, epoch %d\n", b, totalEpochs)
 					continue
 				}
 				totalLoss += loss
 				nn.Backward(shuffledTargets[b], learningRate)
 			}
 			avgLoss := totalLoss / float64(len(inputs))
-			fmt.Printf("Epoch %d, Loss: %.4f\n", totalEpochs+epoch, avgLoss)
+			fmt.Printf("Epoch %d, Loss: %.4f\n", totalEpochs, avgLoss)
 
 			// Check for plateau
 			lossChange := math.Abs(prevLoss - avgLoss)
@@ -98,7 +99,6 @@ func main() {
 					nn.AddNeuronsToLayer(targetLayerForNeurons, 20)
 					hasAddedNeurons = true
 					plateauCount = 0
-					// Continue training in this phase
 				} else {
 					fmt.Println("Loss plateaued again 3 times after adding neurons, adding a new layer")
 					nn.AddLayer(2, 8, 8, "leaky_relu", true)
@@ -106,10 +106,12 @@ func main() {
 					fmt.Println("Now adding neurons to new layer", targetLayerForNeurons)
 					nn.AddNeuronsToLayer(targetLayerForNeurons, 20)
 					plateauCount = 0
-					break // Restart phase with new layer
+					phaseEpochs = epoch + 1 // Record epochs completed in this phase
+					break                   // Restart phase with new layer
 				}
 			}
 			totalEpochs++
+			phaseEpochs++
 		}
 
 		// Print output and accuracy after each phase
