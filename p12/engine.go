@@ -53,7 +53,7 @@ var (
 	maxIterations           = 10
 	maxConsecutiveFailures  = 5
 	minConnections          = 10
-	maxConnections          = 6000
+	maxConnections          = 200
 	currentExactAcc         float64
 	currentClosenessBins    []float64
 	currentApproxScore      float64
@@ -249,39 +249,33 @@ func generation() {
 		// Simulate some work here (if any) - currently empty in your code
 		improved := training() // Check if training improved the model
 
-
-	
-
-
 		if improved {
 			fmt.Println("Regenerating checkpoint due to model improvement...")
 			createInitialCheckpoint() // Update checkpoint with the improved selectedModel
 
 		}
 
-			// After generation training finishes:
-			labels := *phase.GetLabels(&trainSamples, selectedModel.OutputNodes)
-			// Iterate over all new neurons, or filter based on your criteria.
-			for _, neuron := range selectedModel.Neurons {
-				if neuron.IsNew { // or any other criteria you prefer
-					// Run quick optimization on this neuron.
-					// Here we use, say, 5 perturbations, sigma=0.01, and 5 iterations.
-					//selectedModel.OptimizeNewNeuronParameters(neuron.ID, initialCheckpoint, labels, 5, 0.01, 5)
-					//selectedModel.AdaptiveOptimizeNewNeuronParameters(neuron.ID, initialCheckpoint, labels, 5, 0.01, 5, 0.0001)
-					selectedModel.AdaptiveOptimizeNewNeuronParametersV2(neuron.ID, initialCheckpoint, labels, 5, 0.01, 5, 0.0001)
-					
-					// Optionally, mark the neuron as no longer new once optimized.
-					neuron.IsNew = false
-				}
+		// After generation training finishes:
+		/*labels := *phase.GetLabels(&trainSamples, selectedModel.OutputNodes)
+		// Iterate over all new neurons, or filter based on your criteria.
+		for _, neuron := range selectedModel.Neurons {
+			if neuron.IsNew { // or any other criteria you prefer
+				// Run quick optimization on this neuron.
+				// Here we use, say, 5 perturbations, sigma=0.01, and 5 iterations.
+				//selectedModel.OptimizeNewNeuronParameters(neuron.ID, initialCheckpoint, labels, 5, 0.01, 5)
+				//selectedModel.AdaptiveOptimizeNewNeuronParameters(neuron.ID, initialCheckpoint, labels, 5, 0.01, 5, 0.0001)
+				selectedModel.AdaptiveOptimizeNewNeuronParametersV2(neuron.ID, initialCheckpoint, labels, 5, 0.01, 5, 0.0001)
+
+				// Optionally, mark the neuron as no longer new once optimized.
+				neuron.IsNew = false
 			}
+		}
 
-			if improved {
-				fmt.Println("Regenerating checkpoint due to model improvement from optimizer...")
-				createInitialCheckpoint() // Update checkpoint with the improved selectedModel
-				testModelPerformance(initialCheckpoint)
-			}
-
-
+		if improved {
+			fmt.Println("Regenerating checkpoint due to model improvement from optimizer...")
+			createInitialCheckpoint() // Update checkpoint with the improved selectedModel
+			testModelPerformance(initialCheckpoint)
+		}*/
 
 		// Calculate generation duration and update total time
 		genDuration := time.Since(genStartTime)
@@ -297,9 +291,6 @@ func generation() {
 		currentGenNumber++
 		fmt.Printf("=== GEN %d finished. Gen time: %s, Full: %s, Avg: %s\n",
 			generation, genDuration, fullRunningTime, avgGenTime)
-
-
-
 
 		// Evaluate the model on the test set after each generation
 	}
