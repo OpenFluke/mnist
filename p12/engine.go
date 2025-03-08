@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -49,7 +48,7 @@ var (
 	currentGenNumber        = 1
 	layers                  = []int{784, 1, 10}
 	hiddenAct               = "relu"
-	outputAct               = "softmax"
+	outputAct               = "linear"
 	selectedModel           *phase.Phase
 	maxIterations           = 10
 	maxConsecutiveFailures  = 5
@@ -68,19 +67,17 @@ func main() {
 	processStartTime = time.Now()
 	fmt.Printf("Process started at %s\n", processStartTime.Format("2006-01-02 15:04:05"))
 	setupMnist()
+
 	selectedModel = initModel() // Assign the returned model
-	evaluateOnTestSet()
 	generation()
 }
 
 func setupMnist() {
-
 	numCPUs = runtime.NumCPU()
 	numWorkers = int(float64(numCPUs) * 0.8)
 	runtime.GOMAXPROCS(numWorkers)
 	fmt.Printf("Using %d workers (80%% of %d CPUs)\n", numWorkers, numCPUs)
 
-	// Load MNIST dataset
 	fmt.Println("Step 1: Ensuring MNIST dataset is downloaded...")
 	bp := phase.NewPhase()
 	if err := ensureMNISTDownloads(bp, mnistDir); err != nil {
@@ -95,27 +92,47 @@ func setupMnist() {
 	}
 	fmt.Printf("Loaded %d training samples\n", len(trainInputs))
 
-	// Set trainSize to 80% of the total data
 	trainSize = int(0.8 * float64(len(trainInputs)))
-
-	// Calculate testSize as the remaining 20%
 	testSize = len(trainInputs) - trainSize
 
-	// Initialize trainSamples and testSamples slices
-	trainSamples = make([]phase.Sample, trainSize)
-	testSamples = make([]phase.Sample, testSize)
+	// Initialize a temporary model to get OutputNodes
+	tempModel := phase.NewPhaseWithLayers(layers, hiddenAct, outputAct)
+	outputNodes := tempModel.OutputNodes
 
-	// Populate trainSamples (first 80%)
+	// Populate trainSamples with ExpectedOutputs
+	trainSamples = make([]phase.Sample, trainSize)
 	for i := 0; i < trainSize; i++ {
-		trainSamples[i] = phase.Sample{Inputs: trainInputs[i], Label: trainLabels[i]}
+		expectedOutputs := createExpectedOutputs(trainLabels[i], outputNodes)
+		trainSamples[i] = phase.Sample{
+			Inputs:          trainInputs[i],
+			ExpectedOutputs: expectedOutputs,
+		}
 	}
 
-	// Populate testSamples (remaining 20%)
+	// Populate testSamples with ExpectedOutputs
+	testSamples = make([]phase.Sample, testSize)
 	for i := 0; i < testSize; i++ {
-		testSamples[i] = phase.Sample{Inputs: trainInputs[trainSize+i], Label: trainLabels[trainSize+i]}
+		expectedOutputs := createExpectedOutputs(trainLabels[trainSize+i], outputNodes)
+		testSamples[i] = phase.Sample{
+			Inputs:          trainInputs[trainSize+i],
+			ExpectedOutputs: expectedOutputs,
+		}
 	}
 
 	fmt.Printf("Using %d samples for training and %d samples for testing\n", len(trainSamples), len(testSamples))
+}
+
+// createExpectedOutputs converts an integer label to a one-hot encoded map for the output neurons.
+func createExpectedOutputs(label int, outputNodes []int) map[int]float64 {
+	expected := make(map[int]float64)
+	for i, nodeID := range outputNodes {
+		if i == label {
+			expected[nodeID] = 1.0
+		} else {
+			expected[nodeID] = 0.0
+		}
+	}
+	return expected
 }
 
 func initModel() *phase.Phase {
@@ -173,10 +190,9 @@ func testModelPerformance(checkpoint []map[int]map[string]interface{}) {
 
 	// Test on training set (using provided checkpoint)
 	fmt.Println("Testing current model performance on training set...")
-	trainLabels := phase.GetLabels(&trainSamples)
+	trainLabels := phase.GetLabels(&trainSamples, selectedModel.OutputNodes) // Fixed: Added second argument
 
 	trainExactAcc, trainClosenessBins, trainApproxScore := selectedModel.EvaluateWithCheckpoints(checkpointFolder, &checkpoint, trainLabels)
-
 	trainClosenessQuality := selectedModel.ComputeClosenessQuality(trainClosenessBins)
 
 	fmt.Printf("Training Set Metrics (Checkpoint size: %d, Labels size: %d):\n", len(checkpoint), len(*trainLabels))
@@ -247,7 +263,6 @@ func generation() {
 		fmt.Printf("=== GEN %d finished. Gen time: %s, Full: %s, Avg: %s\n",
 			generation, genDuration, fullRunningTime, avgGenTime)
 		// Evaluate the model on the test set after each generation
-		evaluateOnTestSet()
 	}
 }
 
@@ -281,7 +296,7 @@ func training() bool {
 
 	// Initialize metrics if not set (first generation)
 	if currentExactAcc == 0 && len(currentClosenessBins) == 0 && currentApproxScore == 0 {
-		labels := phase.GetLabels(&trainSamples)
+		labels := phase.GetLabels(&trainSamples, baseBP.OutputNodes) // Updated
 		currentExactAcc, currentClosenessBins, currentApproxScore = baseBP.EvaluateWithCheckpoints(checkpointFolder, &initialCheckpoint, labels)
 		currentClosenessQuality = baseBP.ComputeClosenessQuality(currentClosenessBins)
 	}
@@ -403,53 +418,4 @@ func loadMNIST(dir, imageFile, labelFile string, limit int) ([]map[int]float64, 
 		labels[i] = int(lblByte[0])
 	}
 	return inputs, labels, nil
-}
-
-// evaluateOnTestSet assesses the model's performance on the test dataset.
-func evaluateOnTestSet() {
-	if selectedModel == nil {
-		log.Fatalf("Cannot evaluate model: selectedModel is nil")
-	}
-
-	// Create checkpoints for test samples
-	fmt.Println("Creating checkpoints for test samples...")
-	var testCheckpoint []map[int]map[string]interface{}
-	if evalWithMultiCore {
-		testCheckpoint = selectedModel.CheckpointPreOutputNeuronsMultiCore(checkpointFolder, getInputs(testSamples), 1)
-	} else {
-		testCheckpoint = selectedModel.CheckpointPreOutputNeurons(checkpointFolder, getInputs(testSamples), 1)
-	}
-	fmt.Printf("Test checkpoint created with %d samples\n", len(testCheckpoint))
-
-	// Get labels for the test set
-	testLabels := phase.GetLabels(&testSamples)
-
-	// Evaluate existing metrics using checkpoints
-	fmt.Println("Evaluating model on test set...")
-	testExactAcc, testClosenessBins, testApproxScore := selectedModel.EvaluateWithCheckpoints(checkpointFolder, &testCheckpoint, testLabels)
-	testClosenessQuality := selectedModel.ComputeClosenessQuality(testClosenessBins)
-
-	// Compute cross-entropy loss
-	totalLoss := 0.0
-	for _, sample := range testSamples {
-		inputs := sample.Inputs
-		trueLabel := sample.Label
-		selectedModel.Forward(inputs, 1)
-		logits := make([]float64, len(selectedModel.OutputNodes))
-		for j, id := range selectedModel.OutputNodes {
-			logits[j] = selectedModel.Neurons[id].Value
-		}
-		probs := phase.Softmax(logits)              // Assumes Softmax is available in phase package
-		loss := -math.Log(probs[trueLabel] + 1e-10) // Add small epsilon to avoid log(0)
-		totalLoss += loss
-	}
-	avgLoss := totalLoss / float64(len(testSamples))
-
-	// Print all metrics
-	fmt.Printf("Test Set Metrics (Checkpoint size: %d, Labels size: %d):\n", len(testCheckpoint), len(*testLabels))
-	fmt.Printf("  ExactAcc: %.4f%%\n", testExactAcc)
-	fmt.Printf("  Cross-Entropy Loss: %.4f\n", avgLoss)
-	fmt.Printf("  ClosenessBins: %v\n", phase.FormatClosenessBins(testClosenessBins))
-	fmt.Printf("  ApproxScore: %.4f\n", testApproxScore)
-	fmt.Printf("  ClosenessQuality: %.4f\n", testClosenessQuality)
 }
