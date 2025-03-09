@@ -16,23 +16,29 @@ import (
 )
 
 const (
-	baseURL  = "https://storage.googleapis.com/cvdf-datasets/mnist/"
-	mnistDir = "mnist_data"
+	baseURL   = "https://storage.googleapis.com/cvdf-datasets/mnist/"
+	mnistDir  = "mnist_data"
+	modelDir  = "models"
+	modelFile = "mnist_model.bin"
 )
 
+	fmt.Printf("Model loaded from %s\n", filePath)
+	return &nn, nil
+}
+
 func main() {
-	fmt.Println("V5-IMPLEMENTATION-13 (80/20 Train/Test Split)")
+	fmt.Println("V5-IMPLEMENTATION-13 (80/20 Train/Test Split with Model Detection)")
 
 	if err := ensureMNISTDownloads(mnistDir); err != nil {
 		log.Fatalf("Failed to download MNIST data: %v", err)
 	}
 
 	// Load training and test data
-	inputs, targets, err := loadMNISTData(mnistDir, true) // Training data
+	inputs, targets, err := loadMNISTData(mnistDir, true)
 	if err != nil {
 		log.Fatalf("Failed to load MNIST training data: %v", err)
 	}
-	testInputs, testTargets, err := loadMNISTData(mnistDir, false) // Test data
+	testInputs, testTargets, err := loadMNISTData(mnistDir, false)
 	if err != nil {
 		log.Fatalf("Failed to load MNIST test data: %v", err)
 	}
@@ -58,109 +64,126 @@ func main() {
 	fmt.Printf("Training samples: %d, Validation samples: %d, Test samples: %d\n",
 		len(trainInputs), len(valInputs), len(testInputs))
 
-	// Initial network with Leaky ReLU (MLP for MNIST)
-	layerSizes := []struct{ Width, Height int }{
-		{28, 28}, // Input
-		{16, 16}, // Hidden 1
-		{10, 1},  // Output
-	}
-	activations := []string{"leaky_relu", "leaky_relu", "softmax"}
-	fullyConnected := []bool{true, false, true}
+	var nn *paragon.Network
+	modelPath := filepath.Join(modelDir, modelFile)
 
-	nn := paragon.NewNetwork(layerSizes, activations, fullyConnected)
+	// Check if model exists
+	if _, err := os.Stat(modelPath); err == nil {
+		nn, err = LoadModel(modelFile)
+		if err != nil {
+			log.Fatalf("Failed to load existing model: %v", err)
+		}
+		fmt.Println("Using pre-trained model, skipping training.")
+	} else {
+		fmt.Println("No pre-trained model found, starting training...")
+		layerSizes := []struct{ Width, Height int }{
+			{28, 28},
+			{16, 16},
+			{10, 1},
+		}
+		activations := []string{"leaky_relu", "leaky_relu", "softmax"}
+		fullyConnected := []bool{true, false, true}
 
-	// Training parameters
-	epochsPerPhase := 50
-	learningRate := 0.01
-	plateauThreshold := 0.001
-	plateauLimit := 3
-	plateauCount := 0
-	hasAddedNeurons := false
-	targetLayerForNeurons := 1
-	totalEpochs := 0
-	maxTotalEpochs := 5
+		nn = paragon.NewNetwork(layerSizes, activations, fullyConnected)
 
-	// Training loop with dynamic growth
-	for totalEpochs < maxTotalEpochs {
-		prevLoss := math.Inf(1)
-		for epoch := 0; epoch < epochsPerPhase && totalEpochs < maxTotalEpochs; epoch++ {
-			totalLoss := 0.0
-			perm := rand.Perm(len(trainInputs))
-			shuffledInputs := make([][][]float64, len(trainInputs))
-			shuffledTargets := make([][][]float64, len(trainTargets))
-			for i, p := range perm {
-				shuffledInputs[i] = trainInputs[p]
-				shuffledTargets[i] = trainTargets[p]
-			}
-			for b := 0; b < len(shuffledInputs); b++ {
-				nn.Forward(shuffledInputs[b])
-				loss := nn.ComputeLoss(shuffledTargets[b])
-				if math.IsNaN(loss) {
-					fmt.Printf("NaN loss detected at sample %d, epoch %d\n", b, totalEpochs)
-					continue
+		epochsPerPhase := 50
+		learningRate := 0.01
+		plateauThreshold := 0.001
+		plateauLimit := 3
+		plateauCount := 0
+		hasAddedNeurons := false
+		targetLayerForNeurons := 1
+		totalEpochs := 0
+		maxTotalEpochs := 5
+
+		for totalEpochs < maxTotalEpochs {
+			prevLoss := math.Inf(1)
+			for epoch := 0; epoch < epochsPerPhase && totalEpochs < maxTotalEpochs; epoch++ {
+				totalLoss := 0.0
+				perm := rand.Perm(len(trainInputs))
+				shuffledInputs := make([][][]float64, len(trainInputs))
+				shuffledTargets := make([][][]float64, len(trainTargets))
+				for i, p := range perm {
+					shuffledInputs[i] = trainInputs[p]
+					shuffledTargets[i] = trainTargets[p]
 				}
-				totalLoss += loss
-				nn.Backward(shuffledTargets[b], learningRate)
-			}
-			avgLoss := totalLoss / float64(len(trainInputs))
-			fmt.Printf("Epoch %d, Training Loss: %.4f\n", totalEpochs, avgLoss)
+				for b := 0; b < len(shuffledInputs); b++ {
+					nn.Forward(shuffledInputs[b])
+					loss := nn.ComputeLoss(shuffledTargets[b])
+					if math.IsNaN(loss) {
+						fmt.Printf("NaN loss detected at sample %d, epoch %d\n", b, totalEpochs)
+						continue
+					}
+					totalLoss += loss
+					nn.Backward(shuffledTargets[b], learningRate)
+				}
+				avgLoss := totalLoss / float64(len(trainInputs))
+				fmt.Printf("Epoch %d, Training Loss: %.4f\n", totalEpochs, avgLoss)
 
-			// Check for plateau
-			lossChange := math.Abs(prevLoss - avgLoss)
-			if lossChange < plateauThreshold {
-				plateauCount++
-				fmt.Printf("Plateau detected (%d/%d), loss change: %.6f\n", plateauCount, plateauLimit, lossChange)
-			} else {
-				plateauCount = 0
-			}
-			prevLoss = avgLoss
-
-			// Handle plateau actions
-			if plateauCount >= plateauLimit {
-				if !hasAddedNeurons {
-					fmt.Println("Loss plateaued 3 times, adding 20 neurons to layer", targetLayerForNeurons)
-					nn.AddNeuronsToLayer(targetLayerForNeurons, 20)
-					hasAddedNeurons = true
-					plateauCount = 0
+				lossChange := math.Abs(prevLoss - avgLoss)
+				if lossChange < plateauThreshold {
+					plateauCount++
+					fmt.Printf("Plateau detected (%d/%d), loss change: %.6f\n", plateauCount, plateauLimit, lossChange)
 				} else {
-					fmt.Println("Loss plateaued again 3 times after adding neurons, adding a new layer")
-					nn.AddLayer(2, 8, 8, "leaky_relu", true)
-					targetLayerForNeurons = 2
-					fmt.Println("Now adding neurons to new layer", targetLayerForNeurons)
-					nn.AddNeuronsToLayer(targetLayerForNeurons, 20)
 					plateauCount = 0
-					break
 				}
+				prevLoss = avgLoss
+
+				if plateauCount >= plateauLimit {
+					if !hasAddedNeurons {
+						fmt.Println("Loss plateaued 3 times, adding 20 neurons to layer", targetLayerForNeurons)
+						nn.AddNeuronsToLayer(targetLayerForNeurons, 20)
+						hasAddedNeurons = true
+						plateauCount = 0
+					} else {
+						fmt.Println("Loss plateaued again 3 times after adding neurons, adding a new layer")
+						nn.AddLayer(2, 8, 8, "leaky_relu", true)
+						targetLayerForNeurons = 2
+						fmt.Println("Now adding neurons to new layer", targetLayerForNeurons)
+						nn.AddNeuronsToLayer(targetLayerForNeurons, 20)
+						plateauCount = 0
+						break
+					}
+				}
+				totalEpochs++
 			}
-			totalEpochs++
+
+			trainAcc := computeAccuracy(nn, trainInputs, trainTargets)
+			valAcc := computeAccuracy(nn, valInputs, valTargets)
+			testAcc := computeAccuracy(nn, testInputs, testTargets)
+
+			fmt.Printf("After %d epochs:\n", totalEpochs)
+			fmt.Printf("Training Accuracy: %.2f%%\n", trainAcc*100)
+			fmt.Printf("Validation Accuracy: %.2f%%\n", valAcc*100)
+			fmt.Printf("Test Accuracy: %.2f%%\n", testAcc*100)
+
+			if valAcc > 0.95 {
+				fmt.Println("Reached 95% validation accuracy, stopping training")
+				break
+			}
 		}
 
-		// Evaluate accuracy after each phase
-		trainAcc := computeAccuracy(nn, trainInputs, trainTargets)
-		valAcc := computeAccuracy(nn, valInputs, valTargets)
-		testAcc := computeAccuracy(nn, testInputs, testTargets)
-
-		fmt.Printf("After %d epochs:\n", totalEpochs)
-		fmt.Printf("Training Accuracy: %.2f%%\n", trainAcc*100)
-		fmt.Printf("Validation Accuracy: %.2f%%\n", valAcc*100)
-		fmt.Printf("Test Accuracy: %.2f%%\n", testAcc*100)
-
-		if valAcc > 0.95 {
-			fmt.Println("Reached 95% validation accuracy, stopping training")
-			break
+		if err := SaveModel(nn, modelFile); err != nil {
+			log.Fatalf("Failed to save model: %v", err)
 		}
 	}
 
-	fmt.Println("Final network structure:")
+	trainAcc := computeAccuracy(nn, trainInputs, trainTargets)
+	valAcc := computeAccuracy(nn, valInputs, valTargets)
+	testAcc := computeAccuracy(nn, testInputs, testTargets)
+
+	fmt.Println("\nModel performance:")
+	fmt.Printf("Training Accuracy: %.2f%%\n", trainAcc*100)
+	fmt.Printf("Validation Accuracy: %.2f%%\n", valAcc*100)
+	fmt.Printf("Test Accuracy: %.2f%%\n", testAcc*100)
+
+	printRandomSamples(nn, trainInputs, trainTargets, "Training")
+	printRandomSamples(nn, testInputs, testTargets, "Test")
+
+	fmt.Println("\nFinal network structure:")
 	for i, layer := range nn.Layers {
 		fmt.Printf("Layer %d: %dx%d\n", i, layer.Width, layer.Height)
 	}
-
-	// Print 10 random samples from the training set
-	printRandomSamples(nn, trainInputs, trainTargets, "Training")
-
-	// Print 10 random samples from the test set
-	printRandomSamples(nn, testInputs, testTargets, "Test")
 }
 
 // computeAccuracy calculates the network's accuracy on a subset of data
@@ -322,7 +345,7 @@ func loadMNISTData(dir string, isTraining bool) (inputs [][][]float64, targets [
 
 	inputs = make([][][]float64, numImages)
 	targets = make([][][]float64, numImages)
-	imgBuf := make([]byte, 784) // 28x28 pixels
+	imgBuf := make([]byte, 784)
 
 	for i := 0; i < numImages; i++ {
 		if _, err := fImg.Read(imgBuf); err != nil {
@@ -358,7 +381,7 @@ func labelToTarget(label int) [][]float64 {
 	return target
 }
 
-// Helper function to get the argMax from a slice of neuron pointers.
+// argMaxNeurons finds the index of the neuron with the maximum value
 func argMaxNeurons(neurons []*paragon.Neuron) int {
 	maxIdx := 0
 	maxVal := neurons[0].Value
@@ -371,7 +394,7 @@ func argMaxNeurons(neurons []*paragon.Neuron) int {
 	return maxIdx
 }
 
-// Modified function to print 10 random samples with digit labels for each output column.
+// printRandomSamples prints 10 random samples with digit labels
 func printRandomSamples(nn *paragon.Network, inputs [][][]float64, targets [][][]float64, datasetName string) {
 	fmt.Printf("\nRandom samples from %s set:\n", datasetName)
 	indices := rand.Perm(len(inputs))
@@ -384,17 +407,13 @@ func printRandomSamples(nn *paragon.Network, inputs [][][]float64, targets [][][
 		sampleInput := inputs[idx]
 		sampleTarget := targets[idx]
 
-		// Forward propagate the sample.
 		nn.Forward(sampleInput)
-
-		// Retrieve the outputs from the final layer (assumed to be 1 row with 10 columns).
 		outputNeurons := nn.Layers[nn.OutputLayer].Neurons[0]
 		expected := argMax(sampleTarget[0])
 		predicted := argMaxNeurons(outputNeurons)
 
 		fmt.Printf("Sample %d: Expected: %d, Predicted: %d\n", idx, expected, predicted)
 		fmt.Println("Neuron outputs:")
-		// Print each neuron's output along with the corresponding MNIST digit.
 		for digit, neuron := range outputNeurons {
 			fmt.Printf("  Digit %d: %.4f  ", digit, neuron.Value)
 		}
