@@ -33,7 +33,7 @@ func main() {
 	}
 	fmt.Printf("Loaded %d training samples\n", len(inputs))
 
-	// Initial network with Leaky ReLU
+	// Initial network with Leaky ReLU (MLP for MNIST)
 	layerSizes := []struct{ Width, Height int }{
 		{28, 28}, // Input
 		{16, 16}, // Hidden 1
@@ -43,7 +43,7 @@ func main() {
 	fullyConnected := []bool{true, false, true}
 
 	nn := paragon.NewNetwork(layerSizes, activations, fullyConnected)
-	//nn.Debug = true
+	// nn.Debug = true
 
 	// Training parameters
 	epochsPerPhase := 50
@@ -54,7 +54,7 @@ func main() {
 	hasAddedNeurons := false
 	targetLayerForNeurons := 1
 	totalEpochs := 0
-	maxTotalEpochs := 200
+	maxTotalEpochs := 5
 
 	// Training loop with dynamic growth
 	for totalEpochs < maxTotalEpochs {
@@ -70,7 +70,7 @@ func main() {
 				shuffledTargets[i] = targets[p]
 			}
 			for b := 0; b < len(shuffledInputs); b++ {
-				nn.Forward(shuffledInputs[b])
+				nn.Forward(shuffledInputs[b]) // Use standard Forward for MNIST
 				loss := nn.ComputeLoss(shuffledTargets[b])
 				if math.IsNaN(loss) {
 					fmt.Printf("NaN loss detected at sample %d, epoch %d\n", b, totalEpochs)
@@ -106,8 +106,8 @@ func main() {
 					fmt.Println("Now adding neurons to new layer", targetLayerForNeurons)
 					nn.AddNeuronsToLayer(targetLayerForNeurons, 20)
 					plateauCount = 0
-					phaseEpochs = epoch + 1 // Record epochs completed in this phase
-					break                   // Restart phase with new layer
+					phaseEpochs = epoch + 1
+					break
 				}
 			}
 			totalEpochs++
@@ -127,7 +127,6 @@ func main() {
 		accuracy := computeAccuracy(nn, inputs, targets)
 		fmt.Printf("Training accuracy on all samples after %d epochs: %.2f%%\n", totalEpochs, accuracy*100)
 
-		// Exit if accuracy is high enough
 		if accuracy > 0.95 {
 			break
 		}
