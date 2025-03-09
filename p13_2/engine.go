@@ -22,6 +22,145 @@ const (
 	modelFile = "mnist_model.bin"
 )
 
+// SaveModel saves the network to a binary file in the models directory
+func SaveModel(nn *paragon.Network, filename string) error {
+	if err := os.MkdirAll(modelDir, os.ModePerm); err != nil {
+		return fmt.Errorf("failed to create models directory: %w", err)
+	}
+
+	filePath := filepath.Join(modelDir, filename)
+	f, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to create model file %s: %w", filePath, err)
+	}
+	defer f.Close()
+
+	if err := binary.Write(f, binary.BigEndian, int32(len(nn.Layers))); err != nil {
+		return err
+	}
+	for _, layer := range nn.Layers {
+		if err := binary.Write(f, binary.BigEndian, int32(layer.Width)); err != nil {
+			return err
+		}
+		if err := binary.Write(f, binary.BigEndian, int32(layer.Height)); err != nil {
+			return err
+		}
+		for y := 0; y < layer.Height; y++ {
+			for x := 0; x < layer.Width; x++ {
+				neuron := layer.Neurons[y][x]
+				if err := binary.Write(f, binary.BigEndian, neuron.Bias); err != nil {
+					return err
+				}
+				actLen := int32(len(neuron.Activation))
+				if err := binary.Write(f, binary.BigEndian, actLen); err != nil {
+					return err
+				}
+				if _, err := f.Write([]byte(neuron.Activation)); err != nil {
+					return err
+				}
+				if err := binary.Write(f, binary.BigEndian, int32(len(neuron.Inputs))); err != nil {
+					return err
+				}
+				for _, conn := range neuron.Inputs {
+					if err := binary.Write(f, binary.BigEndian, int32(conn.SourceLayer)); err != nil {
+						return err
+					}
+					if err := binary.Write(f, binary.BigEndian, int32(conn.SourceX)); err != nil {
+						return err
+					}
+					if err := binary.Write(f, binary.BigEndian, int32(conn.SourceY)); err != nil {
+						return err
+					}
+					if err := binary.Write(f, binary.BigEndian, conn.Weight); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	fmt.Printf("Model saved to %s\n", filePath)
+	return nil
+}
+
+// LoadModel loads a network from a binary file in the models directory
+func LoadModel(filename string) (*paragon.Network, error) {
+	filePath := filepath.Join(modelDir, filename)
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open model file %s: %w", filePath, err)
+	}
+	defer f.Close()
+
+	var numLayers int32
+	if err := binary.Read(f, binary.BigEndian, &numLayers); err != nil {
+		return nil, err
+	}
+
+	nn := paragon.Network{
+		Layers: make([]paragon.Grid, numLayers),
+	}
+	for l := int32(0); l < numLayers; l++ {
+		var width, height int32
+		if err := binary.Read(f, binary.BigEndian, &width); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(f, binary.BigEndian, &height); err != nil {
+			return nil, err
+		}
+		grid := paragon.Grid{
+			Width:   int(width),
+			Height:  int(height),
+			Neurons: make([][]*paragon.Neuron, height),
+		}
+		for y := 0; y < int(height); y++ {
+			grid.Neurons[y] = make([]*paragon.Neuron, width)
+			for x := 0; x < int(width); x++ {
+				neuron := &paragon.Neuron{} // Fixed: Use &paragon.Neuron{}
+				if err := binary.Read(f, binary.BigEndian, &neuron.Bias); err != nil {
+					return nil, err
+				}
+				var actLen int32
+				if err := binary.Read(f, binary.BigEndian, &actLen); err != nil {
+					return nil, err
+				}
+				actBytes := make([]byte, actLen)
+				if _, err := io.ReadFull(f, actBytes); err != nil {
+					return nil, err
+				}
+				neuron.Activation = string(actBytes)
+				neuron.Type = "dense"
+				var numInputs int32
+				if err := binary.Read(f, binary.BigEndian, &numInputs); err != nil {
+					return nil, err
+				}
+				neuron.Inputs = make([]paragon.Connection, numInputs)
+				for i := int32(0); i < numInputs; i++ {
+					var conn paragon.Connection
+					var srcLayer, srcX, srcY int32
+					if err := binary.Read(f, binary.BigEndian, &srcLayer); err != nil {
+						return nil, err
+					}
+					if err := binary.Read(f, binary.BigEndian, &srcX); err != nil {
+						return nil, err
+					}
+					if err := binary.Read(f, binary.BigEndian, &srcY); err != nil {
+						return nil, err
+					}
+					if err := binary.Read(f, binary.BigEndian, &conn.Weight); err != nil {
+						return nil, err
+					}
+					conn.SourceLayer = int(srcLayer)
+					conn.SourceX = int(srcX)
+					conn.SourceY = int(srcY)
+					neuron.Inputs[i] = conn
+				}
+				grid.Neurons[y][x] = neuron
+			}
+		}
+		nn.Layers[l] = grid
+	}
+	nn.InputLayer = 0
+	nn.OutputLayer = len(nn.Layers) - 1
 	fmt.Printf("Model loaded from %s\n", filePath)
 	return &nn, nil
 }
