@@ -26,17 +26,17 @@ const (
 	checkpointSampleDir  = "checkpoints/sample" // Directory for sample checkpoints
 	checkpointLayerIdx   = 1                    // Layer index for checkpointing
 	numSampleCheckpoints = 5                    // Number of sample checkpoints
+	checkpointTrainDir   = "checkpoints/train"
+	checkpointValDir     = "checkpoints/val"
 )
 
 func main() {
-	// ### Data Preparation
-	// Download and prepare the MNIST dataset if not already present
+	// === Data Preparation ===
+	// (Assume ensureMNISTDownloads, loadMNISTData, and SplitDataset are defined in your code.)
 	if err := ensureMNISTDownloads(mnistDir); err != nil {
 		log.Fatalf("Failed to ensure MNIST downloads: %v", err)
 	}
 	fmt.Println("MNIST data ready.")
-
-	// Load training and test data
 	trainInputs, trainTargets, err := loadMNISTData(mnistDir, true)
 	if err != nil {
 		log.Fatalf("Failed to load training data: %v", err)
@@ -45,13 +45,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load test data: %v", err)
 	}
+	trainSetInputs, trainSetTargets, valInputs, valTargets := paragon.SplitDataset(trainInputs, trainTargets, 0.8)
+	fmt.Printf("Training: %d, Validation: %d, Test: %d\n", len(trainSetInputs), len(valInputs), len(testInputs))
 
-	// Split training data (80% for training, though we only need the full set here)
-	trainSetInputs, trainSetTargets, _, _ := paragon.SplitDataset(trainInputs, trainTargets, 0.8)
-	fmt.Printf("Training samples: %d, Test samples: %d\n", len(trainSetInputs), len(testInputs))
-
-	// ### Model Creation or Loading
-	// Define network architecture
+	// === Model Creation or Loading ===
 	layerSizes := []struct{ Width, Height int }{{28, 28}, {16, 16}, {10, 1}}
 	activations := []string{"leaky_relu", "leaky_relu", "softmax"}
 	fullyConnected := []bool{true, false, true}
@@ -59,14 +56,12 @@ func main() {
 	modelPath := filepath.Join(modelDir, modelFile)
 	var nn *paragon.Network
 	if _, err := os.Stat(modelPath); err == nil {
-		// Load existing model
 		fmt.Println("Pre-trained model found. Loading model...")
 		nn = paragon.NewNetwork(layerSizes, activations, fullyConnected)
 		if err := nn.LoadFromJSON(modelPath); err != nil {
 			log.Fatalf("Failed to load model: %v", err)
 		}
 	} else {
-		// Train and save a new model
 		fmt.Println("No pre-trained model found. Training new model...")
 		nn = paragon.NewNetwork(layerSizes, activations, fullyConnected)
 		trainer := paragon.Trainer{
@@ -87,114 +82,145 @@ func main() {
 		fmt.Println("Model trained and saved.")
 	}
 
-	// Create two copies of the model
-	nnFull := nn // For full forward pass
+	// Create copies for different evaluation methods.
+	nnFull := nn
 	nnCheckpoint := paragon.NewNetwork(layerSizes, activations, fullyConnected)
 	if err := nnCheckpoint.LoadFromJSON(modelPath); err != nil {
-		log.Fatalf("Failed to load model into nnCheckpoint: %v", err)
+		log.Fatalf("Failed to load model into checkpoint copy: %v", err)
 	}
 
-	// ### Create or Load 5 Sample Checkpoints
-	// Create directory for sample checkpoints
+	// === Checkpoint Generation ===
+	// Generate a few sample checkpoints.
 	if err := os.MkdirAll(checkpointSampleDir, os.ModePerm); err != nil {
 		log.Fatalf("Failed to create sample checkpoint directory: %v", err)
 	}
-
-	// Handle the first 5 test samples for checkpointing
-	fmt.Println("Handling 5 sample checkpoint files...")
+	fmt.Println("Handling sample checkpoint files...")
 	for i := 0; i < numSampleCheckpoints; i++ {
 		filename := filepath.Join(checkpointSampleDir, fmt.Sprintf("sample_cp_%d.json", i))
 		if _, err := os.Stat(filename); os.IsNotExist(err) {
-			// Create checkpoint if it doesn't exist
 			input := testInputs[i]
 			nnFull.Forward(input)
 			cpState := nnFull.GetLayerState(checkpointLayerIdx)
 			cpData, err := json.MarshalIndent(cpState, "", "  ")
 			if err != nil {
-				log.Fatalf("Failed to marshal sample checkpoint for sample %d: %v", i, err)
+				log.Fatalf("Failed to marshal sample checkpoint %d: %v", i, err)
 			}
 			if err := os.WriteFile(filename, cpData, 0644); err != nil {
-				log.Fatalf("Failed to write sample checkpoint file for sample %d: %v", i, err)
+				log.Fatalf("Failed to write sample checkpoint %d: %v", i, err)
 			}
-			fmt.Printf("Created checkpoint for sample %d\n", i)
-		} else {
-			fmt.Printf("Checkpoint for sample %d already exists, skipping creation\n", i)
+			fmt.Printf("Created sample checkpoint %d\n", i)
 		}
 	}
 
-	// ### Comparison of Full Pass vs Checkpoint for a Single Sample
-	// Select sample index 0 for comparison
-	// Select sample index for comparison
+	// Create directories for full training and validation checkpoints.
+	if err := os.MkdirAll(checkpointTrainDir, os.ModePerm); err != nil {
+		log.Fatalf("Failed to create training checkpoint directory: %v", err)
+	}
+	if err := os.MkdirAll(checkpointValDir, os.ModePerm); err != nil {
+		log.Fatalf("Failed to create validation checkpoint directory: %v", err)
+	}
+	fmt.Println("Generating checkpoint files for training and validation sets...")
+	// For training set:
+	for i := 0; i < len(trainSetInputs); i++ {
+		filename := filepath.Join(checkpointTrainDir, fmt.Sprintf("sample_cp_%05d.json", i))
+		if _, err := os.Stat(filename); os.IsNotExist(err) {
+			input := trainSetInputs[i]
+			nnFull.Forward(input)
+			cpState := nnFull.GetLayerState(checkpointLayerIdx)
+			cpData, err := json.MarshalIndent(cpState, "", "  ")
+			if err != nil {
+				log.Fatalf("Failed to marshal training checkpoint %d: %v", i, err)
+			}
+			if err := os.WriteFile(filename, cpData, 0644); err != nil {
+				log.Fatalf("Failed to write training checkpoint %d: %v", i, err)
+			}
+		}
+	}
+	// For validation set:
+	for i := 0; i < len(valInputs); i++ {
+		filename := filepath.Join(checkpointValDir, fmt.Sprintf("sample_cp_%05d.json", i))
+		if _, err := os.Stat(filename); os.IsNotExist(err) {
+			input := valInputs[i]
+			nnFull.Forward(input)
+			cpState := nnFull.GetLayerState(checkpointLayerIdx)
+			cpData, err := json.MarshalIndent(cpState, "", "  ")
+			if err != nil {
+				log.Fatalf("Failed to marshal validation checkpoint %d: %v", i, err)
+			}
+			if err := os.WriteFile(filename, cpData, 0644); err != nil {
+				log.Fatalf("Failed to write validation checkpoint %d: %v", i, err)
+			}
+		}
+	}
+
+	// === Evaluation ===
+	// For a single sample:
 	sampleIndex := 0
-	input := testInputs[sampleIndex]
-	cpFile := filepath.Join(checkpointSampleDir, fmt.Sprintf("sample_cp_%d.json", sampleIndex))
-
-	// Ensure checkpoint exists
-	if _, err := os.Stat(cpFile); os.IsNotExist(err) {
-		log.Fatalf("Checkpoint file does not exist for sample %d", sampleIndex)
-	}
-
-	// **Full Forward Pass**
 	fmt.Printf("\n=== Full Forward Pass for Sample %d ===\n", sampleIndex)
-	startFull := time.Now()
-	nnFull.Forward(input)
-	endFull := time.Now()
-	fullTime := endFull.Sub(startFull)
-
-	// Extract and display outputs
+	start := time.Now()
+	nnFull.Forward(testInputs[sampleIndex])
 	fullOut := extractOutput(nnFull)
+	fullTime := time.Since(start)
 	fmt.Printf("Full Forward Time: %v\n", fullTime)
-	fmt.Println("Neuron Outputs (Full Forward):")
-	for i, val := range fullOut {
-		fmt.Printf("Neuron %d: %.6f\n", i, val)
-	}
+	fmt.Printf("Full Output: %v\n", fullOut)
 
-	// **Checkpoint-Based Forward Pass**
 	fmt.Printf("\n=== Checkpoint-Based Forward Pass for Sample %d ===\n", sampleIndex)
-
-	// Load checkpoint with timing
-	startLoad := time.Now()
+	cpFile := filepath.Join(checkpointSampleDir, fmt.Sprintf("sample_cp_%d.json", sampleIndex))
 	data, err := os.ReadFile(cpFile)
 	if err != nil {
-		log.Fatalf("Failed to read checkpoint file %s: %v", cpFile, err)
+		log.Fatalf("Failed to read sample checkpoint: %v", err)
 	}
 	var cpState [][]float64
 	if err := json.Unmarshal(data, &cpState); err != nil {
-		log.Fatalf("Failed to unmarshal checkpoint: %v", err)
+		log.Fatalf("Failed to unmarshal sample checkpoint: %v", err)
 	}
-	endLoad := time.Now()
-	loadTime := endLoad.Sub(startLoad)
-
-	// Perform forward pass from checkpoint with timing
-	startCP := time.Now()
+	start = time.Now()
 	nnCheckpoint.ForwardFromLayer(checkpointLayerIdx, cpState)
-	endCP := time.Now()
-	cpTime := endCP.Sub(startCP)
-
-	// Extract and display outputs
 	cpOut := extractOutput(nnCheckpoint)
-	fmt.Printf("Checkpoint Load Time: %v\n", loadTime)
+	cpTime := time.Since(start)
 	fmt.Printf("Checkpoint Forward Time: %v\n", cpTime)
-	fmt.Println("Neuron Outputs (Checkpoint):")
-	for i, val := range cpOut {
-		fmt.Printf("Neuron %d: %.6f\n", i, val)
-	}
+	fmt.Printf("Checkpoint Output: %v\n", cpOut)
 
-	// **Compare Outputs**
+	// Compare outputs.
 	fmt.Println("\n=== Output Comparison ===")
-	differencesFound := false
 	for i := 0; i < len(fullOut); i++ {
 		diff := math.Abs(fullOut[i] - cpOut[i])
 		if diff > 1e-6 {
-			fmt.Printf("Neuron %d: Full=%.6f, Checkpoint=%.6f, Difference=%.6f\n",
-				i, fullOut[i], cpOut[i], diff)
-			differencesFound = true
+			fmt.Printf("Neuron %d: Full=%.6f, Checkpoint=%.6f, Diff=%.6f\n", i, fullOut[i], cpOut[i], diff)
 		}
 	}
-	if !differencesFound {
-		fmt.Println("No significant differences found between outputs.")
+
+	// Evaluate on the training set using full forward pass.
+	fmt.Println("\n=== ADHD Evaluation on Training Data (Full Forward) ===")
+	start = time.Now()
+	trainScoreFull := computeADHDScoreFull(nnFull, trainSetInputs, trainSetTargets)
+	fmt.Printf("Training Set ADHD Score (Full Forward): %.4f, Time: %v\n", trainScoreFull, time.Since(start))
+
+	// Evaluate on the training set using checkpoint-based evaluation.
+	fmt.Println("\n=== ADHD Evaluation on Training Data (Checkpoint-Based) ===")
+	trainCpFiles := sortedFilesInDir(checkpointTrainDir)
+	// Create expected outputs from your ground truth targets.
+	expectedTrain := make([]float64, len(trainSetTargets))
+	for i, t := range trainSetTargets {
+		expectedTrain[i] = float64(paragon.ArgMax(t[0]))
 	}
-	fmt.Println("Evaluation complete.")
+	score, loadTime, forwardTime := nnCheckpoint.EvaluateFromCheckpointFilesWithTiming(trainCpFiles, expectedTrain, checkpointLayerIdx)
+	fmt.Printf("Training Set ADHD Score (Checkpoint): %.4f, Total Load Time: %v, Total Forward Time: %v\n", score, loadTime, forwardTime)
+
+	// Similarly, evaluate on the validation set.
+	fmt.Println("\n=== ADHD Evaluation on Validation Data (Full Forward) ===")
+	start = time.Now()
+	valScoreFull := computeADHDScoreFull(nnFull, valInputs, valTargets)
+	fmt.Printf("Validation Set ADHD Score (Full Forward): %.4f, Time: %v\n", valScoreFull, time.Since(start))
+
+	fmt.Println("\n=== ADHD Evaluation on Validation Data (Checkpoint-Based) ===")
+	valCpFiles := sortedFilesInDir(checkpointValDir)
+	expectedVal := make([]float64, len(valTargets))
+	for i, t := range valTargets {
+		expectedVal[i] = float64(paragon.ArgMax(t[0]))
+	}
+	score, loadTime, forwardTime = nnCheckpoint.EvaluateFromCheckpointFilesWithTiming(valCpFiles, expectedVal, checkpointLayerIdx)
+	fmt.Printf("Validation Set ADHD Score (Checkpoint): %.4f, Total Load Time: %v, Total Forward Time: %v\n", score, loadTime, forwardTime)
 }
 
 // ## Helper Functions
@@ -399,4 +425,103 @@ func formatOutputHighPrecision(output []float64) string {
 	}
 	sb.WriteString("]")
 	return sb.String()
+}
+
+// computeADHDScoreFull computes the ADHD score using a full forward pass
+func computeADHDScoreFull(nn *paragon.Network, inputs [][][]float64, targets [][][]float64) float64 {
+	var expected, actual []float64
+	for i, input := range inputs {
+		nn.Forward(input)
+		out := extractOutput(nn)
+		pred := paragon.ArgMax(out)
+		trueLabel := paragon.ArgMax(targets[i][0])
+		expected = append(expected, float64(trueLabel))
+		actual = append(actual, float64(pred))
+	}
+	nn.EvaluateModel(expected, actual)
+	return nn.Performance.Score
+}
+
+// computeADHDScoreCheckpoint computes the ADHD score using checkpoint files
+func computeADHDScoreCheckpoint(nn *paragon.Network, checkpointFiles []string, targets [][][]float64, layerIdx int) float64 {
+	var expected, actual []float64
+	for i, cpFile := range checkpointFiles {
+		data, err := os.ReadFile(cpFile)
+		if err != nil {
+			log.Printf("Failed to read checkpoint file %s: %v", cpFile, err)
+			continue
+		}
+		var cpState [][]float64
+		if err := json.Unmarshal(data, &cpState); err != nil {
+			log.Printf("Failed to unmarshal checkpoint file %s: %v", cpFile, err)
+			continue
+		}
+		nn.ForwardFromLayer(layerIdx, cpState)
+		out := extractOutput(nn)
+		pred := paragon.ArgMax(out)
+		trueLabel := paragon.ArgMax(targets[i][0])
+		expected = append(expected, float64(trueLabel))
+		actual = append(actual, float64(pred))
+	}
+	nn.EvaluateModel(expected, actual)
+	return nn.Performance.Score
+}
+
+// computeADHDScoreCheckpointInMemory evaluates ADHD score by first
+// capturing an in-memory checkpoint state at checkpointLayerIdx for each sample,
+// then running the remainder of the forward pass.
+func computeADHDScoreCheckpointInMemory(nn *paragon.Network, inputs [][][]float64, targets [][][]float64, checkpointLayerIdx int) float64 {
+	var expected, actual []float64
+	for i, input := range inputs {
+		// First, run a full forward pass on a copy (or use your full network)
+		nn.Forward(input)
+		// Get checkpoint state from the desired layer
+		cpState := nn.GetLayerState(checkpointLayerIdx)
+		// Now run the forward pass from that checkpoint state using a network copy.
+		// (It is important to use a separate network or reset the network to avoid interference.)
+		nn.ForwardFromLayer(checkpointLayerIdx, cpState)
+		out := extractOutput(nn)
+		pred := paragon.ArgMax(out)
+		trueLabel := paragon.ArgMax(targets[i][0])
+		expected = append(expected, float64(trueLabel))
+		actual = append(actual, float64(pred))
+	}
+	nn.EvaluateModel(expected, actual)
+	return nn.Performance.Score
+}
+
+// computeADHDScoreFromFileCheckpoints evaluates the ADHD score by loading checkpoint files
+// (which were generated beforehand) and running the forward pass from the checkpoint layer.
+// It also accumulates the file load time and the forward pass time.
+func computeADHDScoreFromFileCheckpoints(nn *paragon.Network, checkpointFiles []string, targets [][][]float64, checkpointLayerIdx int) float64 {
+	var expected, actual []float64
+	var totalLoadTime, totalForwardTime time.Duration
+
+	for i, cpFile := range checkpointFiles {
+		startLoad := time.Now()
+		data, err := os.ReadFile(cpFile)
+		if err != nil {
+			log.Printf("Failed to read checkpoint file %s: %v", cpFile, err)
+			continue
+		}
+		var cpState [][]float64
+		if err := json.Unmarshal(data, &cpState); err != nil {
+			log.Printf("Failed to unmarshal checkpoint file %s: %v", cpFile, err)
+			continue
+		}
+		totalLoadTime += time.Since(startLoad)
+
+		startForward := time.Now()
+		nn.ForwardFromLayer(checkpointLayerIdx, cpState)
+		totalForwardTime += time.Since(startForward)
+
+		out := extractOutput(nn)
+		pred := paragon.ArgMax(out)
+		trueLabel := paragon.ArgMax(targets[i][0])
+		expected = append(expected, float64(trueLabel))
+		actual = append(actual, float64(pred))
+	}
+	nn.EvaluateModel(expected, actual)
+	fmt.Printf("Checkpoint file load time: %v, forward time: %v\n", totalLoadTime, totalForwardTime)
+	return nn.Performance.Score
 }
