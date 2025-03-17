@@ -3,6 +3,7 @@ package main
 import (
 	"compress/gzip"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"paragon" // Replace with your actual Paragon package import path
@@ -23,12 +25,124 @@ const (
 	modelFile = "mnist_model.json"
 )
 
+// Global variables for test data.
+var (
+	testInputs [][][]float64
+	testLabels []int
+)
+
+// ModelConfig holds configuration for each model variant.
+type ModelConfig struct {
+	Name               string
+	UseInMemory        bool
+	UseFileCheckpoint  bool
+	CheckpointLayerIdx int
+	// Checkpoint state is computed on-demand per sample.
+}
+
+// LoadModel loads a model if one exists; otherwise, it trains on MNIST.
+func LoadModel(config *ModelConfig, trainInputs, trainTargets, valInputs, valTargets, testInputs, testTargets [][][]float64) (*paragon.Network, error) {
+	layerSizes := []struct{ Width, Height int }{
+		{28, 28}, // Input layer.
+		{16, 16}, // Hidden layer.
+		{10, 1},  // Output layer.
+	}
+	activations := []string{"leaky_relu", "leaky_relu", "softmax"}
+	fullyConnected := []bool{true, false, true}
+
+	modelPath := filepath.Join(modelDir, modelFile)
+	nn := paragon.NewNetwork(layerSizes, activations, fullyConnected)
+
+	if _, err := os.Stat(modelPath); err == nil {
+		fmt.Printf("✅ Found pre-trained model for %s. Loading...\n", config.Name)
+		if err := nn.LoadFromJSON(modelPath); err != nil {
+			return nil, fmt.Errorf("failed to load model from JSON: %v", err)
+		}
+	} else {
+		fmt.Printf("No pre-trained model found for %s; training new network...\n", config.Name)
+		trainer := paragon.Trainer{
+			Network: nn,
+			Config: paragon.TrainConfig{
+				Epochs:           5,
+				LearningRate:     0.01,
+				PlateauThreshold: 0.001,
+				PlateauLimit:     3,
+				EarlyStopAcc:     0.95,
+				Debug:            true,
+			},
+		}
+		trainer.TrainWithValidation(trainInputs, trainTargets, valInputs, valTargets, testInputs, testTargets)
+		if err := nn.SaveToJSON(modelPath); err != nil {
+			return nil, fmt.Errorf("failed to save model to JSON: %v", err)
+		}
+		fmt.Println("✅ Model trained and saved.")
+	}
+	return nn, nil
+}
+
+// InferFull runs a full forward pass on the given sample.
+func InferFull(nn *paragon.Network, input [][]float64) ([]float64, time.Duration) {
+	start := time.Now()
+	nn.Forward(input)
+	duration := time.Since(start)
+	return extractOutput(nn), duration
+}
+
+// InferFromCheckpoint runs only the checkpoint portion (ForwardFromLayer)
+// given an externally computed checkpoint state.
+func InferFromCheckpoint(nn *paragon.Network, cp [][]float64, cpLayer int) ([]float64, time.Duration) {
+	start := time.Now()
+	nn.ForwardFromLayer(cpLayer, cp)
+	duration := time.Since(start)
+	return extractOutput(nn), duration
+}
+
+// InferFromFileCheckpoint writes the provided checkpoint state to a temporary file,
+// reloads it, and then runs ForwardFromLayer.
+func InferFromFileCheckpoint(nn *paragon.Network, cp [][]float64, cpLayer int, configName string) ([]float64, time.Duration) {
+	os.MkdirAll("checkpoints", os.ModePerm)
+	tempFile := fmt.Sprintf("checkpoints/%s_%d_checkpoint_layer_%d.json", configName, time.Now().UnixNano(), cpLayer)
+	data, err := json.Marshal(cp)
+	if err != nil {
+		log.Printf("Failed to marshal checkpoint for %s: %v", configName, err)
+		return nil, 0
+	}
+	if err := os.WriteFile(tempFile, data, 0644); err != nil {
+		log.Printf("Failed to write checkpoint file for %s: %v", configName, err)
+		return nil, 0
+	}
+	loadedCp, err := nn.LoadLayerState(cpLayer, tempFile)
+	if err != nil {
+		log.Printf("Failed to load checkpoint for %s: %v", configName, err)
+		return nil, 0
+	}
+	start := time.Now()
+	nn.ForwardFromLayer(cpLayer, loadedCp)
+	duration := time.Since(start)
+	os.Remove(tempFile)
+	return extractOutput(nn), duration
+}
+
+// extractOutput collects the output values from the network's output layer.
+func extractOutput(nn *paragon.Network) []float64 {
+	outWidth := nn.Layers[nn.OutputLayer].Width
+	output := make([]float64, outWidth)
+	for x := 0; x < outWidth; x++ {
+		output[x] = nn.Layers[nn.OutputLayer].Neurons[0][x].Value
+	}
+	return output
+}
+
 func main() {
-	rand.Seed(time.Now().UnixNano()) // seed for reproducibility
+	rand.Seed(time.Now().UnixNano())
 
-	fmt.Println("MNIST Example with On-Demand Training")
+	// Ensure MNIST data is downloaded.
+	if err := ensureMNISTDownloads(mnistDir); err != nil {
+		log.Fatalf("Failed to download MNIST data: %v", err)
+	}
+	fmt.Println("MNIST Example with Three Model Versions")
 
-	// 1) Load MNIST data
+	// Load MNIST data.
 	trainInputs, trainTargets, err := loadMNISTData(mnistDir, true)
 	if err != nil {
 		log.Fatalf("Failed to load training data: %v", err)
@@ -37,292 +151,128 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load test data: %v", err)
 	}
-
-	// 2) Split training data (80/20 split for train/val)
+	testLabels = make([]int, len(testTargets))
+	for i, target := range testTargets {
+		testLabels[i] = paragon.ArgMax(target[0])
+	}
 	trIn, trTarg, valIn, valTarg := paragon.SplitDataset(trainInputs, trainTargets, 0.8)
-	fmt.Printf("Train samples: %d, Validation samples: %d, Test samples: %d\n",
-		len(trIn), len(valIn), len(testInputs))
+	fmt.Printf("Train samples: %d, Validation samples: %d, Test samples: %d\n", len(trIn), len(valIn), len(testInputs))
 
-	// 3) Define the network architecture
-	layerSizes := []struct{ Width, Height int }{
-		{28, 28}, // Input layer
-		{16, 16}, // Hidden layer
-		{10, 1},  // Output layer
+	// Define model configurations.
+	fullConfig := ModelConfig{Name: "FullForward", UseInMemory: false, UseFileCheckpoint: false, CheckpointLayerIdx: 1}
+	memConfig := ModelConfig{Name: "InMemoryCheckpoint", UseInMemory: true, UseFileCheckpoint: false, CheckpointLayerIdx: 1}
+	fileConfig := ModelConfig{Name: "FileCheckpoint", UseInMemory: false, UseFileCheckpoint: true, CheckpointLayerIdx: 1}
+
+	// Load the base model (full forward model).
+	fullModel, err := LoadModel(&fullConfig, trIn, trTarg, valIn, valTarg, testInputs, testTargets)
+	if err != nil {
+		log.Fatalf("Failed to load full model: %v", err)
 	}
-	activations := []string{"leaky_relu", "leaky_relu", "softmax"}
-	fullyConnected := []bool{true, false, true}
+	// Duplicate the model for checkpoint variants by reloading from JSON.
+	memModel := paragon.NewNetwork([]struct{ Width, Height int }{{28, 28}, {16, 16}, {10, 1}},
+		[]string{"leaky_relu", "leaky_relu", "softmax"}, []bool{true, false, true})
+	if err := memModel.LoadFromJSON(filepath.Join(modelDir, modelFile)); err != nil {
+		log.Fatalf("Failed to load in-memory model: %v", err)
+	}
+	fileModel := paragon.NewNetwork([]struct{ Width, Height int }{{28, 28}, {16, 16}, {10, 1}},
+		[]string{"leaky_relu", "leaky_relu", "softmax"}, []bool{true, false, true})
+	if err := fileModel.LoadFromJSON(filepath.Join(modelDir, modelFile)); err != nil {
+		log.Fatalf("Failed to load file checkpoint model: %v", err)
+	}
 
-	modelPath := filepath.Join(modelDir, modelFile)
+	// --- For a given sample, only fullModel runs a full forward pass.
+	//     Its checkpoint state is then used by memModel and fileModel.
 
-	var nn *paragon.Network
+	// Test on Sample 0:
+	sample0 := testInputs[0]
+	expectedLabel0 := testLabels[0]
+	fmt.Printf("\n=== Testing Sample 0 (Label: %d) ===\n", expectedLabel0)
 
-	// 4) Check if a trained model exists
-	if _, err := os.Stat(modelPath); err == nil {
-		// Model found; load it
-		fmt.Println("✅ Found pre-trained model. Loading...")
-		nn = paragon.NewNetwork(layerSizes, activations, fullyConnected)
-		if err := nn.LoadFromJSON(modelPath); err != nil {
-			log.Fatalf("Failed to load model from JSON: %v", err)
-		}
+	// fullModel runs a complete forward pass.
+	fullOut0, fullTime0 := InferFull(fullModel, sample0)
+	// Extract checkpoint state from fullModel for sample0.
+	cp0 := fullModel.GetLayerState(fullConfig.CheckpointLayerIdx)
+	// memModel runs only the checkpoint portion using cp0.
+	memOut0, memTime0 := InferFromCheckpoint(memModel, cp0, memConfig.CheckpointLayerIdx)
+	// fileModel runs only the checkpoint portion via file I/O using cp0.
+	fileOut0, fileTime0 := InferFromFileCheckpoint(fileModel, cp0, fileConfig.CheckpointLayerIdx, fileConfig.Name)
 
-		fmt.Println("✅ Model loaded. No retraining performed.")
+	fullPred0 := paragon.ArgMax(fullOut0)
+	memPred0 := paragon.ArgMax(memOut0)
+	filePred0 := paragon.ArgMax(fileOut0)
+
+	fmt.Printf("FullForward - Prediction: %d, Time: %.3f ms, Output: %s\n",
+		fullPred0, float64(fullTime0.Nanoseconds())/1e6, formatOutputHighPrecision(fullOut0))
+	fmt.Printf("InMemoryCheckpoint - Prediction: %d, Time: %.3f ms, Output: %s\n",
+		memPred0, float64(memTime0.Nanoseconds())/1e6, formatOutputHighPrecision(memOut0))
+	fmt.Printf("FileCheckpoint - Prediction: %d, Time: %.3f ms, Output: %s\n",
+		filePred0, float64(fileTime0.Nanoseconds())/1e6, formatOutputHighPrecision(fileOut0))
+
+	tolerance := 1e-6
+	if slicesEqual(fullOut0, memOut0, tolerance) && slicesEqual(fullOut0, fileOut0, tolerance) {
+		fmt.Println("✅ Sample 0 outputs match within tolerance.")
 	} else {
-		// 5) Model not found; create a new network and train
-		fmt.Println("No pre-trained model found; creating and training new network...")
-		nn = paragon.NewNetwork(layerSizes, activations, fullyConnected)
-
-		trainer := &paragon.Trainer{
-			Network: nn,
-			Config: paragon.TrainConfig{
-				Epochs:           5,    // e.g. 5
-				LearningRate:     0.01, // base LR
-				PlateauThreshold: 0.001,
-				PlateauLimit:     3,
-				EarlyStopAcc:     0.95, // stop if val accuracy > 95%
-				Debug:            true,
-			},
-		}
-
-		fmt.Println("Starting training/validation loop...")
-		trainer.TrainWithValidation(
-			trIn, trTarg,
-			valIn, valTarg,
-			testInputs, testTargets,
-		)
-
-		// 6) Save the newly trained model
-		if err := nn.SaveToJSON(modelPath); err != nil {
-			log.Fatalf("Failed to save model to JSON: %v", err)
-		}
-
-		fmt.Println("✅ Model trained and saved.")
+		fmt.Println("❌ Sample 0 outputs do not match!")
+		fmt.Printf("Max diff (full vs mem): %.17f\n", maxDifference(fullOut0, memOut0))
+		fmt.Printf("Max diff (full vs file): %.17f\n", maxDifference(fullOut0, fileOut0))
 	}
 
-	// 7) Evaluate final performance
-	trainAcc := paragon.ComputeAccuracy(nn, trIn, trTarg)
-	valAcc := paragon.ComputeAccuracy(nn, valIn, valTarg)
-	testAcc := paragon.ComputeAccuracy(nn, testInputs, testTargets)
+	// Test on Sample 1:
+	sample1 := testInputs[1]
+	expectedLabel1 := testLabels[1]
+	fmt.Printf("\n=== Testing Sample 1 (Label: %d) ===\n", expectedLabel1)
 
-	fmt.Println("\nFinal model performance:")
-	fmt.Printf("Training Accuracy: %.2f%%\n", trainAcc*100)
-	fmt.Printf("Validation Accuracy: %.2f%%\n", valAcc*100)
-	fmt.Printf("Test Accuracy: %.2f%%\n", testAcc*100)
+	fullOut1, fullTime1 := InferFull(fullModel, sample1)
+	cp1 := fullModel.GetLayerState(fullConfig.CheckpointLayerIdx)
+	memOut1, memTime1 := InferFromCheckpoint(memModel, cp1, memConfig.CheckpointLayerIdx)
+	fileOut1, fileTime1 := InferFromFileCheckpoint(fileModel, cp1, fileConfig.CheckpointLayerIdx, fileConfig.Name)
 
-	// 8) Evaluate with ADHD
-	paragon.EvaluateWithADHD(nn, testInputs, testTargets)
-	adhdPerf := nn.Performance
-	fmt.Printf("\n🔍 ADHD Analysis Results:\n")
-	fmt.Printf("Model Performance Score: %.2f\n", adhdPerf.Score)
-	for bucket, data := range adhdPerf.Buckets {
-		fmt.Printf("%s → %d samples\n", bucket, data.Count)
+	fullPred1 := paragon.ArgMax(fullOut1)
+	memPred1 := paragon.ArgMax(memOut1)
+	filePred1 := paragon.ArgMax(fileOut1)
+
+	fmt.Printf("FullForward - Prediction: %d, Time: %.3f ms, Output: %s\n",
+		fullPred1, float64(fullTime1.Nanoseconds())/1e6, formatOutputHighPrecision(fullOut1))
+	fmt.Printf("InMemoryCheckpoint - Prediction: %d, Time: %.3f ms, Output: %s\n",
+		memPred1, float64(memTime1.Nanoseconds())/1e6, formatOutputHighPrecision(memOut1))
+	fmt.Printf("FileCheckpoint - Prediction: %d, Time: %.3f ms, Output: %s\n",
+		filePred1, float64(fileTime1.Nanoseconds())/1e6, formatOutputHighPrecision(fileOut1))
+
+	if slicesEqual(fullOut1, memOut1, tolerance) && slicesEqual(fullOut1, fileOut1, tolerance) {
+		fmt.Println("✅ Sample 1 outputs match within tolerance.")
+	} else {
+		if !slicesEqual(fullOut1, memOut1, tolerance) {
+			fmt.Printf("❌ InMemoryCheckpoint differs from FullForward for sample 1! Max diff: %.17f\n", maxDifference(fullOut1, memOut1))
+		}
+		if !slicesEqual(fullOut1, fileOut1, tolerance) {
+			fmt.Printf("❌ FileCheckpoint differs from FullForward for sample 1! Max diff: %.17f\n", maxDifference(fullOut1, fileOut1))
+		}
 	}
+
+	fmt.Println("\nRaw output differences for Sample 1:")
+	printRawDifferences("Sample 1", fullOut1, memOut1, fileOut1)
 
 	fmt.Println("\nAll done!")
 }
 
-func OLDmain() {
-	fmt.Println("V5-IMPLEMENTATION-13 (80/20 Train/Test Split with Model Detection)")
-
-	if err := ensureMNISTDownloads(mnistDir); err != nil {
-		log.Fatalf("Failed to download MNIST data: %v", err)
-	}
-
-	// Load training and test data
-	inputs, targets, err := loadMNISTData(mnistDir, true)
-	if err != nil {
-		log.Fatalf("Failed to load MNIST training data: %v", err)
-	}
-	testInputs, testTargets, err := loadMNISTData(mnistDir, false)
-	if err != nil {
-		log.Fatalf("Failed to load MNIST test data: %v", err)
-	}
-
-	// Split training data into 80% train, 20% validation
-	trainSize := int(0.8 * float64(len(inputs)))
-	perm := rand.Perm(len(inputs))
-	trainInputs := make([][][]float64, trainSize)
-	trainTargets := make([][][]float64, trainSize)
-	valInputs := make([][][]float64, len(inputs)-trainSize)
-	valTargets := make([][][]float64, len(inputs)-trainSize)
-
-	for i, p := range perm {
-		if i < trainSize {
-			trainInputs[i] = inputs[p]
-			trainTargets[i] = targets[p]
-		} else {
-			valInputs[i-trainSize] = inputs[p]
-			valTargets[i-trainSize] = targets[p]
-		}
-	}
-
-	fmt.Printf("Training samples: %d, Validation samples: %d, Test samples: %d\n",
-		len(trainInputs), len(valInputs), len(testInputs))
-
-	var nn *paragon.Network
-	modelPath := filepath.Join(modelDir, modelFile)
-
-	// Define the network architecture (must match the saved model)
-	layerSizes := []struct{ Width, Height int }{
-		{28, 28}, // Input layer
-		{16, 16}, // Hidden layer
-		{10, 1},  // Output layer
-	}
-	activations := []string{"leaky_relu", "leaky_relu", "softmax"}
-	fullyConnected := []bool{true, false, true}
-
-	// Check if model exists
-	if _, err := os.Stat(modelPath); err == nil {
-		fmt.Println("✅ Loading pre-trained model...")
-		nn = paragon.NewNetwork(layerSizes, activations, fullyConnected) // Initialize nn
-		err = nn.LoadFromBinary(modelPath)
-		if err != nil {
-			log.Fatalf("⚠️ Failed to load existing model: %v", err)
-		}
-		fmt.Println("✅ Using pre-trained model.")
-	} else {
-		fmt.Println("No pre-trained model found, starting training...")
-		nn = paragon.NewNetwork(layerSizes, activations, fullyConnected)
-
-		epochsPerPhase := 50
-		learningRate := 0.01
-		plateauThreshold := 0.001
-		plateauLimit := 3
-		plateauCount := 0
-		hasAddedNeurons := false
-		targetLayerForNeurons := 1
-		totalEpochs := 0
-		maxTotalEpochs := 5
-
-		for totalEpochs < maxTotalEpochs {
-			prevLoss := math.Inf(1)
-			for epoch := 0; epoch < epochsPerPhase && totalEpochs < maxTotalEpochs; epoch++ {
-				totalLoss := 0.0
-				perm := rand.Perm(len(trainInputs))
-				shuffledInputs := make([][][]float64, len(trainInputs))
-				shuffledTargets := make([][][]float64, len(trainTargets))
-				for i, p := range perm {
-					shuffledInputs[i] = trainInputs[p]
-					shuffledTargets[i] = trainTargets[p]
-				}
-				for b := 0; b < len(shuffledInputs); b++ {
-					nn.Forward(shuffledInputs[b])
-					loss := nn.ComputeLoss(shuffledTargets[b])
-					if math.IsNaN(loss) {
-						fmt.Printf("NaN loss detected at sample %d, epoch %d\n", b, totalEpochs)
-						continue
-					}
-					totalLoss += loss
-					nn.Backward(shuffledTargets[b], learningRate)
-				}
-				avgLoss := totalLoss / float64(len(trainInputs))
-				fmt.Printf("Epoch %d, Training Loss: %.4f\n", totalEpochs, avgLoss)
-
-				lossChange := math.Abs(prevLoss - avgLoss)
-				if lossChange < plateauThreshold {
-					plateauCount++
-					fmt.Printf("Plateau detected (%d/%d), loss change: %.6f\n", plateauCount, plateauLimit, lossChange)
-				} else {
-					plateauCount = 0
-				}
-				prevLoss = avgLoss
-
-				if plateauCount >= plateauLimit {
-					if !hasAddedNeurons {
-						fmt.Println("Loss plateaued 3 times, adding 20 neurons to layer", targetLayerForNeurons)
-						nn.AddNeuronsToLayer(targetLayerForNeurons, 20)
-						hasAddedNeurons = true
-						plateauCount = 0
-					} else {
-						fmt.Println("Loss plateaued again 3 times after adding neurons, adding a new layer")
-						nn.AddLayer(2, 8, 8, "leaky_relu", true)
-						targetLayerForNeurons = 2
-						fmt.Println("Now adding neurons to new layer", targetLayerForNeurons)
-						nn.AddNeuronsToLayer(targetLayerForNeurons, 20)
-						plateauCount = 0
-						break
-					}
-				}
-				totalEpochs++
-			}
-
-			trainAcc := computeAccuracy(nn, trainInputs, trainTargets)
-			valAcc := computeAccuracy(nn, valInputs, valTargets)
-			testAcc := computeAccuracy(nn, testInputs, testTargets)
-
-			fmt.Printf("After %d epochs:\n", totalEpochs)
-			fmt.Printf("Training Accuracy: %.2f%%\n", trainAcc*100)
-			fmt.Printf("Validation Accuracy: %.2f%%\n", valAcc*100)
-			fmt.Printf("Test Accuracy: %.2f%%\n", testAcc*100)
-
-			if valAcc > 0.95 {
-				fmt.Println("Reached 95% validation accuracy, stopping training")
-				break
-			}
-		}
-
-		// Save trained model
-		if err := nn.SaveToBinary(modelPath); err != nil { // Use modelPath here
-			log.Fatalf("⚠️ Failed to save trained model: %v", err)
-		}
-		fmt.Println("✅ Model trained and saved.")
-	}
-
-	trainAcc := computeAccuracy(nn, trainInputs, trainTargets)
-	valAcc := computeAccuracy(nn, valInputs, valTargets)
-	testAcc := computeAccuracy(nn, testInputs, testTargets)
-
-	fmt.Println("\nModel performance:")
-	fmt.Printf("Training Accuracy: %.2f%%\n", trainAcc*100)
-	fmt.Printf("Validation Accuracy: %.2f%%\n", valAcc*100)
-	fmt.Printf("Test Accuracy: %.2f%%\n", testAcc*100)
-
-	// Run ADHD Analysis after evaluating test accuracy
-	EvaluateModelWithADHD(nn, testInputs, testTargets, "adhd_results.json")
-
-	//printRandomSamples(nn, trainInputs, trainTargets, "Training")
-	//printRandomSamples(nn, testInputs, testTargets, "Test")
-
-	fmt.Println("\nFinal network structure:")
-	for i, layer := range nn.Layers {
-		fmt.Printf("Layer %d: %dx%d\n", i, layer.Width, layer.Height)
+// printRawDifferences prints the raw neuron outputs and differences between the three methods.
+func printRawDifferences(sampleName string, fullOut, memOut, fileOut []float64) {
+	fmt.Printf("----- %s -----\n", sampleName)
+	fmt.Printf("%-8s | %-24s | %-24s | %-24s | %-24s | %-24s\n", "Index", "FullForward", "InMemory", "FileCheckpoint", "Diff (Full-Mem)", "Diff (Full-File)")
+	for i := 0; i < len(fullOut); i++ {
+		diffMem := fullOut[i] - memOut[i]
+		diffFile := fullOut[i] - fileOut[i]
+		fmt.Printf("%-8d | %-24.17f | %-24.17f | %-24.17f | %-24.17f | %-24.17f\n",
+			i, fullOut[i], memOut[i], fileOut[i], diffMem, diffFile)
 	}
 }
 
-// computeAccuracy calculates the network's accuracy on a subset of data
-func computeAccuracy(nn *paragon.Network, inputs [][][]float64, targets [][][]float64) float64 {
-	correct := 0
-	for i := range inputs {
-		nn.Forward(inputs[i])
-		outputValues := make([]float64, nn.Layers[nn.OutputLayer].Width)
-		for x := 0; x < nn.Layers[nn.OutputLayer].Width; x++ {
-			outputValues[x] = nn.Layers[nn.OutputLayer].Neurons[0][x].Value
-		}
-		pred := argMax(outputValues)
-		label := argMax(targets[i][0])
-		if pred == label {
-			correct++
-		}
-	}
-	return float64(correct) / float64(len(inputs))
-}
+// ------------------ Helper Functions ------------------
 
-// argMax finds the index of the maximum value in a slice
-func argMax(arr []float64) int {
-	maxIdx := 0
-	for i := 1; i < len(arr); i++ {
-		if arr[i] > arr[maxIdx] {
-			maxIdx = i
-		}
-	}
-	return maxIdx
-}
-
-// ensureMNISTDownloads downloads and unzips MNIST files if they are not present
 func ensureMNISTDownloads(targetDir string) error {
 	if err := os.MkdirAll(targetDir, os.ModePerm); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", targetDir, err)
 	}
-
 	files := []struct {
 		compressed   string
 		uncompressed string
@@ -332,11 +282,9 @@ func ensureMNISTDownloads(targetDir string) error {
 		{"t10k-images-idx3-ubyte.gz", "t10k-images-idx3-ubyte"},
 		{"t10k-labels-idx1-ubyte.gz", "t10k-labels-idx1-ubyte"},
 	}
-
 	for _, f := range files {
 		compressedPath := filepath.Join(targetDir, f.compressed)
 		uncompressedPath := filepath.Join(targetDir, f.uncompressed)
-
 		if _, err := os.Stat(uncompressedPath); os.IsNotExist(err) {
 			if _, err := os.Stat(compressedPath); os.IsNotExist(err) {
 				fmt.Printf("Downloading %s...\n", f.compressed)
@@ -356,49 +304,41 @@ func ensureMNISTDownloads(targetDir string) error {
 	return nil
 }
 
-// downloadFile downloads a file from a URL to the specified path
 func downloadFile(url, filepath string) error {
 	resp, err := http.Get(url)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
 	out, err := os.Create(filepath)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
-
 	_, err = io.Copy(out, resp.Body)
 	return err
 }
 
-// unzipFile decompresses a .gz file to the specified output path
 func unzipFile(src, dest string) error {
 	fSrc, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer fSrc.Close()
-
 	gzReader, err := gzip.NewReader(fSrc)
 	if err != nil {
 		return err
 	}
 	defer gzReader.Close()
-
 	fDest, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
 	defer fDest.Close()
-
 	_, err = io.Copy(fDest, gzReader)
 	return err
 }
 
-// loadMNISTData loads MNIST data (training or test) into Paragon format
 func loadMNISTData(dir string, isTraining bool) (inputs [][][]float64, targets [][][]float64, err error) {
 	prefix := "train"
 	if !isTraining {
@@ -410,7 +350,6 @@ func loadMNISTData(dir string, isTraining bool) (inputs [][][]float64, targets [
 		return nil, nil, fmt.Errorf("failed to open image file: %w", err)
 	}
 	defer fImg.Close()
-
 	var imgHeader [16]byte
 	if _, err := fImg.Read(imgHeader[:]); err != nil {
 		return nil, nil, fmt.Errorf("failed to read image header: %w", err)
@@ -424,14 +363,12 @@ func loadMNISTData(dir string, isTraining bool) (inputs [][][]float64, targets [
 	if rows != 28 || cols != 28 {
 		return nil, nil, fmt.Errorf("unexpected image dimensions: %dx%d", rows, cols)
 	}
-
 	lblPath := filepath.Join(dir, prefix+"-labels-idx1-ubyte")
 	fLbl, err := os.Open(lblPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open label file: %w", err)
 	}
 	defer fLbl.Close()
-
 	var lblHeader [8]byte
 	if _, err := fLbl.Read(lblHeader[:]); err != nil {
 		return nil, nil, fmt.Errorf("failed to read label header: %w", err)
@@ -440,15 +377,12 @@ func loadMNISTData(dir string, isTraining bool) (inputs [][][]float64, targets [
 		return nil, nil, fmt.Errorf("invalid label magic number: %d", magic)
 	}
 	numLabels := int(binary.BigEndian.Uint32(lblHeader[4:8]))
-
 	if numImages != numLabels {
 		return nil, nil, fmt.Errorf("mismatch between number of images (%d) and labels (%d)", numImages, numLabels)
 	}
-
 	inputs = make([][][]float64, numImages)
 	targets = make([][][]float64, numImages)
 	imgBuf := make([]byte, 784)
-
 	for i := 0; i < numImages; i++ {
 		if _, err := fImg.Read(imgBuf); err != nil {
 			return nil, nil, fmt.Errorf("failed to read image %d: %w", i, err)
@@ -461,7 +395,6 @@ func loadMNISTData(dir string, isTraining bool) (inputs [][][]float64, targets [
 			}
 		}
 		inputs[i] = img
-
 		var lblByte [1]byte
 		if _, err := fLbl.Read(lblByte[:]); err != nil {
 			return nil, nil, fmt.Errorf("failed to read label %d: %w", i, err)
@@ -469,11 +402,9 @@ func loadMNISTData(dir string, isTraining bool) (inputs [][][]float64, targets [
 		label := int(lblByte[0])
 		targets[i] = labelToTarget(label)
 	}
-
 	return inputs, targets, nil
 }
 
-// labelToTarget converts an integer label to a one-hot encoded 1x10 slice
 func labelToTarget(label int) [][]float64 {
 	target := make([][]float64, 1)
 	target[0] = make([]float64, 10)
@@ -483,91 +414,51 @@ func labelToTarget(label int) [][]float64 {
 	return target
 }
 
-// argMaxNeurons finds the index of the neuron with the maximum value
-func argMaxNeurons(neurons []*paragon.Neuron) int {
+func argMax(arr []float64) int {
 	maxIdx := 0
-	maxVal := neurons[0].Value
-	for i, neuron := range neurons {
-		if neuron.Value > maxVal {
-			maxVal = neuron.Value
+	for i := 1; i < len(arr); i++ {
+		if arr[i] > arr[maxIdx] {
 			maxIdx = i
 		}
 	}
 	return maxIdx
 }
 
-// printRandomSamples prints 10 random samples with digit labels
-func printRandomSamples(nn *paragon.Network, inputs [][][]float64, targets [][][]float64, datasetName string) {
-	fmt.Printf("\nRandom samples from %s set:\n", datasetName)
-	indices := rand.Perm(len(inputs))
-	sampleCount := 10
-	if sampleCount > len(indices) {
-		sampleCount = len(indices)
+func slicesEqual(a, b []float64, tol float64) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	for i := 0; i < sampleCount; i++ {
-		idx := indices[i]
-		sampleInput := inputs[idx]
-		sampleTarget := targets[idx]
-
-		nn.Forward(sampleInput)
-		outputNeurons := nn.Layers[nn.OutputLayer].Neurons[0]
-		expected := argMax(sampleTarget[0])
-		predicted := argMaxNeurons(outputNeurons)
-
-		fmt.Printf("Sample %d: Expected: %d, Predicted: %d\n", idx, expected, predicted)
-		fmt.Println("Neuron outputs:")
-		for digit, neuron := range outputNeurons {
-			fmt.Printf("  Digit %d: %.4f  ", digit, neuron.Value)
+	for i := range a {
+		if math.Abs(a[i]-b[i]) > tol {
+			return false
 		}
-		fmt.Println("\n---------------------------")
 	}
+	return true
 }
 
-func EvaluateModelWithADHD(nn *paragon.Network, inputs [][][]float64, targets [][][]float64, filename string) {
-	// Use the same layer structure as the trained model
-	layerSizes := []struct{ Width, Height int }{
-		{28, 28},
-		{16, 16},
-		{10, 1},
-	}
-	activations := []string{"leaky_relu", "leaky_relu", "softmax"}
-	fullyConnected := []bool{true, false, true}
-
-	adhdNetwork := paragon.NewNetwork(layerSizes, activations, fullyConnected) // ✅ Correctly initialized
-
-	expectedOutputs := make([]float64, len(inputs))
-	actualOutputs := make([]float64, len(inputs))
-
-	// Run forward pass on each sample
-	for i := range inputs {
-		nn.Forward(inputs[i]) // Get the model's output
-
-		// Extract the predicted and expected values
-		outputValues := make([]float64, nn.Layers[nn.OutputLayer].Width)
-		for x := 0; x < nn.Layers[nn.OutputLayer].Width; x++ {
-			outputValues[x] = nn.Layers[nn.OutputLayer].Neurons[0][x].Value
+func formatOutputHighPrecision(output []float64) string {
+	var sb strings.Builder
+	sb.WriteString("[")
+	for i, val := range output {
+		if i > 0 {
+			sb.WriteString(", ")
 		}
-		predicted := argMax(outputValues) // Get the model's predicted class
-		expected := argMax(targets[i][0]) // Get the actual class label
-
-		expectedOutputs[i] = float64(expected)
-		actualOutputs[i] = float64(predicted)
+		sb.WriteString(fmt.Sprintf("%.17f", val))
 	}
+	sb.WriteString("]")
+	return sb.String()
+}
 
-	// Run ADHD evaluation
-	adhdNetwork.EvaluateModel(expectedOutputs, actualOutputs)
-
-	// Print ADHD results
-	fmt.Printf("\n🔍 ADHD Analysis Results:\n")
-	fmt.Printf("Model Performance Score: %.2f\n", adhdNetwork.Performance.Score)
-	for bucket, data := range adhdNetwork.Performance.Buckets {
-		fmt.Printf("%s → %d samples\n", bucket, data.Count)
+func maxDifference(a, b []float64) float64 {
+	if len(a) != len(b) {
+		return math.Inf(1)
 	}
-
-	// Save results to file
-	if err := adhdNetwork.SaveToJSON(filename); err != nil {
-		fmt.Printf("⚠️ Failed to save ADHD results: %v\n", err)
-	} else {
-		fmt.Printf("✅ ADHD results saved to %s\n", filename)
+	maxDiff := 0.0
+	for i := range a {
+		diff := math.Abs(a[i] - b[i])
+		if diff > maxDiff {
+			maxDiff = diff
+		}
 	}
+	return maxDiff
 }
