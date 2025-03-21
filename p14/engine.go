@@ -239,8 +239,13 @@ func main() {
 		subActivations := []string{"linear", "leaky_relu", "linear"}
 		subFullyConnected := []bool{true, true, true}
 
+		opts := paragon.SetLayerDimensionOptions{
+			Shared:     false,    // Each neuron gets its own sub-network instance
+			InitMethod: "xavier", // Use Xavier initialization for better convergence
+		}
+
 		// Assign that mini-network to every neuron in layer 1:
-		nn.SetLayerDimension(1, subLayerSizes, subActivations, subFullyConnected)
+		nn.SetLayerDimension(1, subLayerSizes, subActivations, subFullyConnected, opts)
 
 		/*nn.SetLayerDimensionShared(
 			1,                 // the layer you want
